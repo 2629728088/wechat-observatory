@@ -1,0 +1,50 @@
+﻿<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <queries>
+        <package android:name="com.tencent.mm" />
+        <package android:name="com.android.shell" />
+    </queries>
+
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <application
+        android:allowBackup="false"
+        android:label="WeChat Observatory"
+        android:forceQueryable="true"
+        android:supportsRtl="true">
+        <meta-data
+            android:name="xposedmodule"
+            android:value="true" />
+        <meta-data
+            android:name="xposeddescription"
+            android:value="Post WeChat message events to wechat-observatory." />
+        <meta-data
+            android:name="xposedminversion"
+            android:value="93" />
+        <meta-data
+            android:name="xposedscope"
+            android:resource="@array/xposed_scope" />
+
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="true"
+            android:label="@string/settings_title">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <provider
+            android:name=".BridgeConfigProvider"
+            android:authorities="cc.wechat.observatory.config"
+            android:exported="true" />
+
+        <receiver
+            android:name=".BridgeConfigReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="cc.wechat.observatory.SET_CONFIG" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

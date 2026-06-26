@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wechat-observatory
+  namespace: wechat-observatory
+  labels:
+    app: wechat-observatory
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: wechat-observatory
+  template:
+    metadata:
+      labels:
+        app: wechat-observatory
+    spec:
+      hostNetwork: true
+      nodeSelector:
+        kubernetes.io/hostname: vm-0-16-centos
+      containers:
+        - name: gateway
+          image: docker.io/rancher/mirrored-library-busybox:1.37.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -ec
+            - /opt/wechat-observatory/wechat-observatory/wechat-observatory-linux-amd64
+          envFrom:
+            - configMapRef:
+                name: wechat-observatory-config
+            - secretRef:
+                name: wechat-observatory-secrets
+          ports:
+            - name: http
+              containerPort: 8088
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8088
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8088
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          volumeMounts:
+            - name: runtime
+              mountPath: /opt/wechat-observatory/wechat-observatory
+              readOnly: true
+      volumes:
+        - name: runtime
+          hostPath:
+            path: /opt/wechat-observatory/wechat-observatory
+            type: Directory

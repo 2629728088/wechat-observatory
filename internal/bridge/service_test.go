@@ -1,0 +1,1164 @@
+package bridge
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"wechat-observatory/internal/config"
+)
+
+const testAPIKey = "wechat-a-key"
+
+func TestIngestPublishesAndPersistsWithoutBusinessReply(t *testing.T) {
+	outbox := &fakeOutbox{}
+	persistence := &fakePersistence{}
+	service := newTestService("", WithOutbox(outbox), WithPersistence(persistence))
+
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey:    testAPIKey,
+		ID:        "101",
+		Device:    "phone-a",
+		From:      "wxid_friend",
+		To:        "wxid_self",
+		Text:      "ping",
+		Direction: DirectionRecv,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Published || result.PersistenceError != "" {
+		t.Fatalf("unexpected ingest result: %+v", result)
+	}
+	if len(persistence.inboundEvents) != 1 {
+		t.Fatalf("expected one persisted inbound event, got %+v", persistence.inboundEvents)
+	}
+	if len(outbox.items) != 0 {
+		t.Fatalf("webhook ingest must not enqueue automatic replies: %+v", outbox.items)
+	}
+	if got := service.Hub().Recent(1); len(got) != 1 || got[0].Text != "ping" || got[0].ChatID() != "wxid_friend" {
+		t.Fatalf("unexpected hub event: %+v", got)
+	}
+}
+
+func TestIngestStoresMediaAttachment(t *testing.T) {
+	persistence := &fakePersistence{}
+	service := newTestService("", WithPersistence(persistence), WithMediaDir(t.TempDir()))
+	raw := []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 1, 2, 3}
+
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey:      testAPIKey,
+		ID:          "media-101",
+		Device:      "phone-a",
+		From:        "wxid_friend",
+		To:          "wxid_self",
+		Text:        "[鍥剧墖]",
+		MessageType: 3,
+		Direction:   DirectionRecv,
+		MediaKind:   "image",
+		MediaMime:   "image/png",
+		MediaName:   "photo.png",
+		MediaBase64: base64.StdEncoding.EncodeToString(raw),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Published || result.PersistenceError != "" {
+		t.Fatalf("unexpected ingest result: %+v", result)
+	}
+	if len(persistence.inboundEvents) != 1 {
+		t.Fatalf("expected one inbound event, got %+v", persistence.inboundEvents)
+	}
+	event := persistence.inboundEvents[0]
+	if event.MediaBase64 != "" || event.MediaURL == "" || event.MediaKind != "image" || event.MediaMime != "image/png" {
+		t.Fatalf("unexpected persisted media fields: %+v", event)
+	}
+	if event.MediaSize != int64(len(raw)) {
+		t.Fatalf("unexpected media size=%d", event.MediaSize)
+	}
+	fullPath, err := service.MediaFilePath(strings.TrimPrefix(event.MediaURL, "/api/media/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := os.ReadFile(fullPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(stored, raw) {
+		t.Fatalf("stored media mismatch: %x", stored)
+	}
+}
+
+func TestLsposedWebhookStoresInboundMessageOnly(t *testing.T) {
+	outbox := &fakeOutbox{}
+	service := newTestService("", WithOutbox(outbox))
+	server := NewHTTPServer(service, "admin").Handler()
+
+	body, err := json.Marshal(MessageEvent{
+		APIKey:    testAPIKey,
+		Device:    "phone-a",
+		Direction: DirectionRecv,
+		From:      "wxid_friend",
+		To:        "wxid_self",
+		Text:      "ping",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/webhook/lsposed/message", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	var payload struct {
+		OK     bool         `json:"ok"`
+		Result IngestResult `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.OK || !payload.Result.Published || payload.Result.PersistenceError != "" {
+		t.Fatalf("unexpected webhook response: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "business") || strings.Contains(rec.Body.String(), "command") || strings.Contains(rec.Body.String(), "scene") {
+		t.Fatalf("webhook response still exposes business fields: %s", rec.Body.String())
+	}
+	items := pollOutbox(t, service, "phone-a", 10)
+	if len(items) != 0 {
+		t.Fatalf("inbound webhook should not enqueue outbox replies: %+v", items)
+	}
+}
+
+func TestLiveEventsStreamsPublishedMessages(t *testing.T) {
+	service := newTestService("")
+	server := httptest.NewServer(NewHTTPServer(service, "admin").Handler())
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/live/events?password=admin", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected status %d", resp.StatusCode)
+	}
+
+	got := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		var out strings.Builder
+		deadline := time.After(2 * time.Second)
+		for {
+			select {
+			case <-deadline:
+				got <- out.String()
+				return
+			default:
+			}
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				out.Write(buf[:n])
+				if strings.Contains(out.String(), "live ping") {
+					got <- out.String()
+					return
+				}
+			}
+			if err != nil {
+				got <- out.String()
+				return
+			}
+		}
+	}()
+
+	body, err := json.Marshal(MessageEvent{
+		APIKey:    testAPIKey,
+		Device:    "phone-a",
+		Direction: DirectionRecv,
+		From:      "wxid_friend",
+		To:        "wxid_self",
+		Text:      "live ping",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	postReq, err := http.NewRequestWithContext(t.Context(), http.MethodPost, server.URL+"/webhook/lsposed/message", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	postResp, err := http.DefaultClient.Do(postReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = postResp.Body.Close()
+	if postResp.StatusCode != http.StatusOK {
+		t.Fatalf("unexpected post status %d", postResp.StatusCode)
+	}
+
+	select {
+	case stream := <-got:
+		if !strings.Contains(stream, "event: message") || !strings.Contains(stream, "live ping") {
+			t.Fatalf("stream did not contain message event: %s", stream)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for live event")
+	}
+}
+
+func TestSentMessagesAreObservedWithoutBusinessRouting(t *testing.T) {
+	outbox := &fakeOutbox{}
+	service := newTestService("", WithOutbox(outbox))
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey:    testAPIKey,
+		ID:        "sent-101",
+		Device:    "phone-a",
+		From:      "wxid_self",
+		To:        "wxid_friend",
+		Text:      "寮€澶氬彿",
+		Direction: DirectionSent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Published {
+		t.Fatalf("unexpected sent event result: %+v", result)
+	}
+	if len(outbox.items) != 0 {
+		t.Fatalf("sent observation must not re-enter business or enqueue replies: %+v", outbox.items)
+	}
+}
+
+func TestAdminSendTextRequiresCurrentOwnerWxID(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	body := []byte(`{"device":"phone-a","owner_wxid":"wxid_self","wx_ids":["wxid_friend"],"text":"manual reply"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/send/text", bytes.NewReader(body))
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
+	}
+	items := pollOutbox(t, service, "phone-a", 10)
+	if len(items) != 1 || items[0].OwnerWxID != "wxid_self" || items[0].WxID != "wxid_friend" || items[0].Text != "manual reply" {
+		t.Fatalf("unexpected outbox items: %+v", items)
+	}
+
+	staleBody := []byte(`{"device":"phone-a","owner_wxid":"wxid_stale","wx_ids":["wxid_friend"],"text":"stale reply"}`)
+	staleReq := httptest.NewRequest(http.MethodPost, "/api/send/text", bytes.NewReader(staleBody))
+	staleReq.Header.Set("X-Bridge-Password", "admin")
+	staleRec := httptest.NewRecorder()
+	server.ServeHTTP(staleRec, staleReq)
+	if staleRec.Code != http.StatusBadRequest {
+		t.Fatalf("stale owner should be rejected, got status %d body=%s", staleRec.Code, staleRec.Body.String())
+	}
+
+	missingOwnerBody := []byte(`{"device":"phone-a","wx_ids":["wxid_friend"],"text":"missing owner"}`)
+	missingOwnerReq := httptest.NewRequest(http.MethodPost, "/api/send/text", bytes.NewReader(missingOwnerBody))
+	missingOwnerReq.Header.Set("X-Bridge-Password", "admin")
+	missingOwnerRec := httptest.NewRecorder()
+	server.ServeHTTP(missingOwnerRec, missingOwnerReq)
+	if missingOwnerRec.Code != http.StatusBadRequest {
+		t.Fatalf("missing owner should be rejected, got status %d body=%s", missingOwnerRec.Code, missingOwnerRec.Body.String())
+	}
+}
+
+func TestRegisterModuleKeepsIdentityStableAcrossWeChatSwitch(t *testing.T) {
+	service := newTestService("http://127.0.0.1:1")
+
+	first, err := service.RegisterModule(t.Context(), ModuleRegistrationRequest{
+		APIKey:   "wechat-a-key",
+		Device:   "phone-a",
+		WxID:     "wxid_wechat_a1",
+		Nickname: "WeChat A1",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	moved, err := service.RegisterModule(t.Context(), ModuleRegistrationRequest{
+		APIKey:   "wechat-a-key",
+		Device:   "phone-a",
+		WxID:     "wxid_wechat_a2",
+		Nickname: "WeChat A2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Device.Name != "phone-a" || first.Device.WxID != "wxid_wechat_a1" {
+		t.Fatalf("unexpected first registration: %+v", first)
+	}
+	if moved.Device.Name != "phone-a" || moved.Device.WxID != "wxid_wechat_a2" {
+		t.Fatalf("unexpected moved registration: %+v", moved)
+	}
+	if device, ok := service.Device("phone-a"); !ok || device.WxID != "wxid_wechat_a2" {
+		t.Fatalf("device wxid should follow the latest registration: ok=%v device=%+v", ok, device)
+	}
+	other, err := service.RegisterModule(t.Context(), ModuleRegistrationRequest{
+		APIKey:   "wechat-b-key",
+		Device:   "phone-a",
+		WxID:     "wxid_wechat_b",
+		Nickname: "WeChat B",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.Device.Name != "device-wechat-b-key" || other.Device.WxID != "wxid_wechat_b" {
+		t.Fatalf("unexpected separate API key registration: %+v", other)
+	}
+}
+
+func TestRegisterModuleKeepsAPIKeyDeviceWhenWxIDWasSeenOnAnotherDevice(t *testing.T) {
+	persistence := &fakePersistence{
+		deviceByWxID: map[string]config.Device{
+			"wxid_self": {
+				Name:     "phone-a",
+				WxID:     "wxid_self",
+				Nickname: "WeChat Phone",
+			},
+		},
+	}
+	service := newTestService("http://127.0.0.1:1", WithPersistence(persistence))
+
+	result, err := service.RegisterModule(t.Context(), ModuleRegistrationRequest{
+		APIKey:   "wechat-b-key",
+		WxID:     "wxid_self",
+		Nickname: "Same WeChat",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Device.Name != "device-wechat-b-key" {
+		t.Fatalf("api key should keep its own device, got %+v", result.Device)
+	}
+	keys := service.APIKeys()
+	var bound config.APIKey
+	for _, key := range keys {
+		if key.Code == "wechat-b-key" {
+			bound = key
+			break
+		}
+	}
+	if bound.Device != "device-wechat-b-key" {
+		t.Fatalf("api key should not be rebound by wxid lookup, got %+v", bound)
+	}
+}
+
+func TestModuleOutboxIgnoresStaleOwnerWxIDAfterSwitch(t *testing.T) {
+	outbox := &fakeOutbox{}
+	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox))
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device:    "phone-a",
+		OwnerWxID: "wxid_self",
+		WxIDs:     []string{"wxid_friend"},
+		Text:      "old owner queued",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.RegisterModule(t.Context(), ModuleRegistrationRequest{
+		APIKey:   "wechat-a-key",
+		Device:   "phone-a",
+		WxID:     "wxid_self_new",
+		Nickname: "WeChat New",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.PollOutbox(t.Context(), ModulePollRequest{
+		APIKey: testAPIKey,
+		Device: "phone-a",
+		WxID:   "wxid_self",
+		Limit:  1,
+	}); err == nil || !strings.Contains(err.Error(), "not current device wxid") {
+		t.Fatalf("expected stale owner poll rejection, got %v", err)
+	}
+	items, err := service.PollOutbox(t.Context(), ModulePollRequest{
+		APIKey: testAPIKey,
+		Device: "phone-a",
+		WxID:   "wxid_self_new",
+		Limit:  1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 0 {
+		t.Fatalf("old-owner outbox item should not be leased by new login: %+v", items)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device:    "phone-a",
+		OwnerWxID: "wxid_self",
+		WxIDs:     []string{"wxid_friend"},
+		Text:      "stale admin send",
+	}); err == nil || !strings.Contains(err.Error(), "not current device wxid") {
+		t.Fatalf("expected stale owner send rejection, got %v", err)
+	}
+}
+
+func TestRegisterModulePersistsStableIdentity(t *testing.T) {
+	persistence := &fakePersistence{}
+	service := newTestService("http://127.0.0.1:1", WithPersistence(persistence))
+
+	result, err := service.RegisterModule(t.Context(), ModuleRegistrationRequest{
+		APIKey:   "wechat-a-key",
+		Device:   "phone-a",
+		WxID:     "wxid_new_self",
+		Nickname: "New WeChat",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Device.Name != "phone-a" || result.Device.WxID != "wxid_new_self" {
+		t.Fatalf("unexpected registration device: %+v", result.Device)
+	}
+	if persistence.deviceName != "phone-a" || persistence.deviceWxID != "wxid_new_self" || persistence.deviceNickname != "WeChat Phone" {
+		t.Fatalf("device identity was not persisted: name=%q wxid=%q nickname=%q", persistence.deviceName, persistence.deviceWxID, persistence.deviceNickname)
+	}
+	if len(persistence.moduleActivities) != 1 || persistence.moduleActivities[0].Kind != "register" || persistence.moduleActivities[0].APIKey != "wechat-a-key" {
+		t.Fatalf("module register activity was not recorded: %+v", persistence.moduleActivities)
+	}
+}
+
+func TestIngestRecordsPersistenceChain(t *testing.T) {
+	persistence := &fakePersistence{}
+	outbox := &fakeOutbox{}
+	service := newTestService("", WithPersistence(persistence), WithOutbox(outbox))
+
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey:    testAPIKey,
+		ID:        "persist-101",
+		Device:    "phone-a",
+		From:      "wxid_friend",
+		To:        "wxid_self",
+		Text:      "ping",
+		Direction: DirectionRecv,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Published || result.PersistenceError != "" {
+		t.Fatalf("unexpected ingest result: %+v", result)
+	}
+	if strings.Join(persistence.calls, ",") != "inbound" {
+		t.Fatalf("unexpected persistence calls: %+v", persistence.calls)
+	}
+	if len(outbox.items) != 0 {
+		t.Fatalf("pure gateway ingest should not enqueue replies: %+v", outbox.items)
+	}
+}
+
+func TestModuleRegisterEndpointUsesAPIKey(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	body := []byte(`{"api_key":"wechat-a-key","device":"phone-a","wxid":"wxid_module","nickname":"Module WeChat"}`)
+	req := httptest.NewRequest(http.MethodPost, "/module/register", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		OK     bool `json:"ok"`
+		Result struct {
+			Device struct {
+				Name     string `json:"name"`
+				WxID     string `json:"wxid"`
+				Nickname string `json:"nickname"`
+			} `json:"device"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !payload.OK || payload.Result.Device.Name != "phone-a" || payload.Result.Device.WxID != "wxid_module" {
+		t.Fatalf("unexpected register payload: %s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), `"Name"`) || strings.Contains(rec.Body.String(), `"WxID"`) || strings.Contains(rec.Body.String(), `"Timeout"`) {
+		t.Fatalf("register response leaked Go device field names: %s", rec.Body.String())
+	}
+	if device, ok := service.Device("phone-a"); !ok || device.WxID != "wxid_module" {
+		t.Fatalf("device wxid was not updated: ok=%v device=%+v", ok, device)
+	}
+}
+
+func TestModuleRegisterEndpointRejectsBadCode(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	req := httptest.NewRequest(http.MethodPost, "/module/register", bytes.NewReader([]byte(`{"api_key":"bad","device":"phone-a","wxid":"wxid_module"}`)))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAPIKeyDisableStopsAndEnableRestoresModuleAuth(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	disableReq := httptest.NewRequest(http.MethodPost, "/api/api-keys/wechat-a-key/disable", nil)
+	disableReq.Header.Set("X-Bridge-Password", "admin")
+	disableRec := httptest.NewRecorder()
+	server.ServeHTTP(disableRec, disableReq)
+	if disableRec.Code != http.StatusOK || !strings.Contains(disableRec.Body.String(), `"enabled":false`) {
+		t.Fatalf("unexpected disable response status=%d body=%s", disableRec.Code, disableRec.Body.String())
+	}
+
+	_, err := service.RegisterModule(t.Context(), ModuleRegistrationRequest{
+		APIKey: "wechat-a-key",
+		WxID:   "wxid_module",
+	})
+	if err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("disabled api key should reject module auth, got %v", err)
+	}
+
+	enableReq := httptest.NewRequest(http.MethodPost, "/api/api-keys/wechat-a-key/enable", nil)
+	enableReq.Header.Set("X-Bridge-Password", "admin")
+	enableRec := httptest.NewRecorder()
+	server.ServeHTTP(enableRec, enableReq)
+	if enableRec.Code != http.StatusOK || !strings.Contains(enableRec.Body.String(), `"enabled":true`) {
+		t.Fatalf("unexpected enable response status=%d body=%s", enableRec.Code, enableRec.Body.String())
+	}
+	if _, err := service.RegisterModule(t.Context(), ModuleRegistrationRequest{
+		APIKey: "wechat-a-key",
+		WxID:   "wxid_module",
+	}); err != nil {
+		t.Fatalf("enabled api key should register again: %v", err)
+	}
+}
+
+func TestAdminReadEndpointsUsePersistentReader(t *testing.T) {
+	reader := &fakeAdminReader{
+		keys: []APIKeyView{
+			{Code: "wechat-a-key", APIKey: "wechat-a-key"},
+		},
+		events: []StoredEventView{
+			{ID: 7, Device: "phone-a", Text: "hello"},
+		},
+		messages: []StoredEventView{
+			{ID: 9, Device: "phone-a", Text: "chat"},
+		},
+		modules: []ModuleStatusView{
+			{Device: "phone-a", RuntimeStatus: "ready"},
+		},
+		contacts: []ModuleContactView{
+			{Device: "phone-a", WxID: "wxid_friend", Nickname: "Friend"},
+		},
+	}
+	service := newTestService("http://127.0.0.1:1", WithAdminReader(reader))
+	server := NewHTTPServer(service, "admin").Handler()
+
+	cases := []struct {
+		path string
+		want string
+	}{
+		{path: "/api/api-keys?limit=1", want: `"api_keys"`},
+		{path: "/api/stored-events?limit=1", want: `"events"`},
+		{path: "/api/messages?device=phone-a&wxid=wxid_friend&limit=1", want: `"messages"`},
+		{path: "/api/modules/status", want: `"modules"`},
+		{path: "/api/module-contacts?device=phone-a&q=Friend&limit=1", want: `"contacts"`},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+		req.Header.Set("X-Bridge-Password", "admin")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), tc.want) {
+			t.Fatalf("%s unexpected status=%d body=%s", tc.path, rec.Code, rec.Body.String())
+		}
+	}
+	if got := strings.Join(reader.calls, ","); !strings.Contains(got, "keys:1") || !strings.Contains(got, "events:1") || !strings.Contains(got, "messages:phone-a:wxid_friend:1") || !strings.Contains(got, "modules") || !strings.Contains(got, "contacts:phone-a:Friend:1") {
+		t.Fatalf("persistent reader was not used as expected: %+v", reader.calls)
+	}
+}
+
+func TestAdminCanGenerateAPIKeyAndRenameDevice(t *testing.T) {
+	service := newTestService("http://127.0.0.1:1")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	body := []byte(`{"api_key":"wg_web_key","device":"phone-web","nickname":"Web WeChat"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/api-keys", bytes.NewReader(body))
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected api key status %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"api_key"`) || !strings.Contains(rec.Body.String(), `"phone-web"`) {
+		t.Fatalf("unexpected api key response: %s", rec.Body.String())
+	}
+
+	deviceBody := []byte(`{"name":"phone-a","nickname":"Web Phone A"}`)
+	deviceReq := httptest.NewRequest(http.MethodPost, "/api/devices", bytes.NewReader(deviceBody))
+	deviceReq.Header.Set("X-Bridge-Password", "admin")
+	deviceRec := httptest.NewRecorder()
+	server.ServeHTTP(deviceRec, deviceReq)
+	if deviceRec.Code != http.StatusOK {
+		t.Fatalf("unexpected device status %d body=%s", deviceRec.Code, deviceRec.Body.String())
+	}
+	if !strings.Contains(deviceRec.Body.String(), `"device_nickname":"Web Phone A"`) {
+		t.Fatalf("unexpected device response: %s", deviceRec.Body.String())
+	}
+
+	deleteReq := httptest.NewRequest(http.MethodDelete, "/api/api-keys/wg_web_key", nil)
+	deleteReq.Header.Set("X-Bridge-Password", "admin")
+	deleteRec := httptest.NewRecorder()
+	server.ServeHTTP(deleteRec, deleteReq)
+	if deleteRec.Code != http.StatusOK {
+		t.Fatalf("unexpected delete api key status %d body=%s", deleteRec.Code, deleteRec.Body.String())
+	}
+	for _, code := range service.APIKeys() {
+		if code.Code == "wg_web_key" {
+			t.Fatalf("api key was not removed")
+		}
+	}
+}
+
+func TestLegacyBusinessAdminEndpointsAreGone(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+	for _, path := range []string{"/api/commands", "/api/replies"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("X-Bridge-Password", "admin")
+		rec := httptest.NewRecorder()
+		server.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s should be removed, got status=%d body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestModuleContactsSnapshotEndpointPersistsContacts(t *testing.T) {
+	persistence := &fakePersistence{}
+	service := newTestService("http://127.0.0.1:1", WithPersistence(persistence))
+	server := NewHTTPServer(service, "admin").Handler()
+
+	body := []byte(`{"api_key":"wechat-a-key","device":"phone-a","wxid":"wxid_self","complete":true,"contacts":[{"wxid":"wxid_friend","nickname":"Friend"},{"wxid":"","nickname":"ignored"}]}`)
+	req := httptest.NewRequest(http.MethodPost, "/module/contacts/snapshot", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"count":1`) {
+		t.Fatalf("unexpected contacts response status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if len(persistence.contactSnapshots) != 1 || len(persistence.contactSnapshots[0].Contacts) != 1 || persistence.contactSnapshots[0].Contacts[0].WxID != "wxid_friend" {
+		t.Fatalf("unexpected persisted contact snapshot: %+v", persistence.contactSnapshots)
+	}
+}
+
+func TestModuleStatusEndpointFallsBackToRuntimeSnapshot(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/modules/status", nil)
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"device":"phone-a"`) || !strings.Contains(rec.Body.String(), `"runtime_status":"ready"`) {
+		t.Fatalf("unexpected status response %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminReadEndpointsRequireAdminPassword(t *testing.T) {
+	service := newTestService("http://127.0.0.1:1")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/modules/status", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestAdminReadEndpointsRejectBridgeTokenHeader(t *testing.T) {
+	service := newTestService("http://127.0.0.1:1")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/modules/status", nil)
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestModuleOutboxPollAndAckEndpoints(t *testing.T) {
+	outbox := &fakeOutbox{}
+	persistence := &fakePersistence{}
+	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox), WithPersistence(persistence))
+	server := NewHTTPServer(service, "admin").Handler()
+
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a",
+		WxIDs:  []string{"wxid_friend"},
+		Text:   "queued reply",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	pollBody := []byte(`{"api_key":"wechat-a-key","device":"phone-a","limit":10}`)
+	pollReq := httptest.NewRequest(http.MethodPost, "/module/outbox/poll", bytes.NewReader(pollBody))
+	pollRec := httptest.NewRecorder()
+	server.ServeHTTP(pollRec, pollReq)
+	if pollRec.Code != http.StatusOK {
+		t.Fatalf("unexpected poll status %d body=%s", pollRec.Code, pollRec.Body.String())
+	}
+	var pollPayload struct {
+		OK    bool               `json:"ok"`
+		Items []ModuleOutboxItem `json:"items"`
+	}
+	if err := json.Unmarshal(pollRec.Body.Bytes(), &pollPayload); err != nil {
+		t.Fatal(err)
+	}
+	if !pollPayload.OK || len(pollPayload.Items) != 1 || pollPayload.Items[0].Text != "queued reply" || pollPayload.Items[0].Status != "leased" {
+		t.Fatalf("unexpected poll payload: %s", pollRec.Body.String())
+	}
+
+	ackBody := []byte(`{"api_key":"wechat-a-key","device":"phone-a","items":[{"id":1,"status":"sent","chat_record_id":9001}]}`)
+	ackReq := httptest.NewRequest(http.MethodPost, "/module/outbox/ack", bytes.NewReader(ackBody))
+	ackRec := httptest.NewRecorder()
+	server.ServeHTTP(ackRec, ackReq)
+	if ackRec.Code != http.StatusOK {
+		t.Fatalf("unexpected ack status %d body=%s", ackRec.Code, ackRec.Body.String())
+	}
+	if len(persistence.outboundEvents) != 1 ||
+		persistence.outboundEvents[0].ChatRecordID != 9001 ||
+		persistence.outboundEvents[0].RawProvider != RawProviderModuleAck ||
+		persistence.outboundEvents[0].OwnerWxID != "wxid_self" {
+		t.Fatalf("ack did not record outbound event: %+v", persistence.outboundEvents)
+	}
+	if len(persistence.moduleActivities) != 2 ||
+		persistence.moduleActivities[0].Kind != "poll" || persistence.moduleActivities[0].PollItemCount != 1 ||
+		persistence.moduleActivities[1].Kind != "ack" || persistence.moduleActivities[1].AckSentCount != 1 {
+		t.Fatalf("module poll/ack activity was not recorded: %+v", persistence.moduleActivities)
+	}
+}
+
+func TestModuleOutboxWebSocketPushAndAck(t *testing.T) {
+	outbox := &fakeOutbox{}
+	persistence := &fakePersistence{}
+	service := newTestService("http://127.0.0.1:1", WithOutbox(outbox), WithPersistence(persistence))
+	server := httptest.NewServer(NewHTTPServer(service, "admin").Handler())
+	defer server.Close()
+
+	conn := dialTestWebSocket(t, server.URL, "/module/outbox/ws?api_key=wechat-a-key&device=phone-a&wxid=wxid_self")
+	defer conn.close()
+
+	ready := readTestWSMessage(t, conn)
+	if ready.Type != "ready" || !ready.OK {
+		t.Fatalf("unexpected ready message: %+v", ready)
+	}
+	if _, err := service.SendText(t.Context(), SendTextRequest{
+		Device: "phone-a",
+		WxIDs:  []string{"wxid_friend"},
+		Text:   "queued through ws",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	outboxMsg := readTestWSMessage(t, conn)
+	if outboxMsg.Type != "outbox" || len(outboxMsg.Items) != 1 || outboxMsg.Items[0].Text != "queued through ws" || outboxMsg.Items[0].Status != "leased" {
+		t.Fatalf("unexpected outbox message: %+v", outboxMsg)
+	}
+	ack := ModuleAckRequest{
+		Items: []ModuleAckItem{{
+			ID:           outboxMsg.Items[0].ID,
+			Status:       "sent",
+			ChatRecordID: 9101,
+		}},
+	}
+	if !conn.writeJSON(outboxWSMessage{Type: "ack", Ack: &ack}) {
+		t.Fatal("failed to write websocket ack")
+	}
+	ackMsg := readTestWSMessageOfType(t, conn, "ack")
+	if ackMsg.Type != "ack" || !ackMsg.OK || len(ackMsg.Items) != 1 || ackMsg.Items[0].Status != "sent" {
+		t.Fatalf("unexpected ack message: %+v", ackMsg)
+	}
+	if len(persistence.outboundEvents) != 1 ||
+		persistence.outboundEvents[0].ChatRecordID != 9101 ||
+		persistence.outboundEvents[0].RawProvider != RawProviderModuleAck ||
+		persistence.outboundEvents[0].OwnerWxID != "wxid_self" {
+		t.Fatalf("ack did not record outbound event: %+v", persistence.outboundEvents)
+	}
+	hasAckActivity := false
+	for _, activity := range persistence.moduleActivities {
+		if activity.Kind == "ack" && activity.AckSentCount == 1 {
+			hasAckActivity = true
+		}
+	}
+	if !hasAckActivity {
+		t.Fatalf("module websocket activity was not recorded: %+v", persistence.moduleActivities)
+	}
+}
+
+func TestModuleOutboxPollIsSerializedForWeChatSender(t *testing.T) {
+	service := newTestService("")
+	for _, text := range []string{"first queued reply", "second queued reply"} {
+		if _, err := service.SendText(t.Context(), SendTextRequest{
+			Device: "phone-a",
+			WxIDs:  []string{"wxid_friend"},
+			Text:   text,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	items, err := service.PollOutbox(t.Context(), ModulePollRequest{
+		APIKey: testAPIKey,
+		Device: "phone-a",
+		Limit:  10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != 1 || items[0].Text != "first queued reply" {
+		t.Fatalf("unexpected serialized poll items: %+v", items)
+	}
+}
+
+func TestModuleRegisterUsesWebBoundDevice(t *testing.T) {
+	service := newTestService("http://127.0.0.1:1")
+	result, err := service.RegisterModule(t.Context(), ModuleRegistrationRequest{
+		APIKey: "wechat-phone-b-key",
+		Device: "phone-a",
+		WxID:   "wxid_self_wrong_device",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Device.Name != "phone-b" || result.Device.WxID != "wxid_self_wrong_device" {
+		t.Fatalf("web-bound device should win over module payload: %+v", result)
+	}
+}
+
+func pollOutbox(t *testing.T, service *Service, device string, limit int) []ModuleOutboxItem {
+	t.Helper()
+	items, err := service.PollOutbox(t.Context(), ModulePollRequest{
+		APIKey: testAPIKey,
+		Device: device,
+		Limit:  limit,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return items
+}
+
+func newTestService(legacyEndpoint string, opts ...Option) *Service {
+	return NewService(Config{
+		DefaultDevice: "phone-a",
+		Devices: map[string]config.Device{
+			"phone-a": {
+				Name:     "phone-a",
+				WxID:     "wxid_self",
+				Nickname: "WeChat Phone",
+				Timeout:  time.Second,
+			},
+			"phone-b": {
+				Name:     "phone-b",
+				WxID:     "wxid_unbound_phone_b",
+				Nickname: "WeChat Phone B",
+				Timeout:  time.Second,
+			},
+		},
+		APIKeys: map[string]config.APIKey{
+			"wechat-a-key": {
+				Code:   "wechat-a-key",
+				Device: "phone-a",
+			},
+			"wechat-b-key": {
+				Code: "wechat-b-key",
+			},
+			"wechat-phone-b-key": {
+				Code:   "wechat-phone-b-key",
+				Device: "phone-b",
+			},
+		},
+	}, opts...)
+}
+
+type fakePersistence struct {
+	deviceName       string
+	deviceWxID       string
+	deviceNickname   string
+	deviceByWxID     map[string]config.Device
+	inboundEvents    []MessageEvent
+	outboundEvents   []MessageEvent
+	moduleActivities []ModuleActivity
+	contactSnapshots []ModuleContactSnapshotRequest
+	calls            []string
+}
+
+func (p *fakePersistence) UpdateDeviceIdentity(_ context.Context, deviceName string, wxid string, nickname string) error {
+	p.deviceName = deviceName
+	p.deviceWxID = wxid
+	p.deviceNickname = nickname
+	return nil
+}
+
+func (p *fakePersistence) LookupDeviceByWxID(_ context.Context, wxid string) (config.Device, bool, error) {
+	if p.deviceByWxID == nil {
+		return config.Device{}, false, nil
+	}
+	device, ok := p.deviceByWxID[wxid]
+	return device, ok, nil
+}
+
+func (p *fakePersistence) UpsertAPIKey(_ context.Context, key config.APIKey) error {
+	p.calls = append(p.calls, "upsert-key:"+key.Code)
+	return nil
+}
+
+func (p *fakePersistence) DeleteAPIKey(_ context.Context, code string) error {
+	p.calls = append(p.calls, "delete-key:"+code)
+	return nil
+}
+
+func (p *fakePersistence) SetAPIKeyEnabled(_ context.Context, code string, enabled bool) error {
+	p.calls = append(p.calls, fmt.Sprintf("key-enabled:%s:%t", code, enabled))
+	return nil
+}
+
+func (p *fakePersistence) RecordInboundEvent(_ context.Context, event MessageEvent) error {
+	p.calls = append(p.calls, "inbound")
+	p.inboundEvents = append(p.inboundEvents, event)
+	return nil
+}
+
+func (p *fakePersistence) RecordOutboundEvent(_ context.Context, event MessageEvent) error {
+	p.calls = append(p.calls, "outbound")
+	p.outboundEvents = append(p.outboundEvents, event)
+	return nil
+}
+
+func (p *fakePersistence) RecordModuleActivity(_ context.Context, activity ModuleActivity) error {
+	p.calls = append(p.calls, "module:"+activity.Kind)
+	p.moduleActivities = append(p.moduleActivities, activity)
+	return nil
+}
+
+func (p *fakePersistence) RecordModuleContacts(_ context.Context, snapshot ModuleContactSnapshotRequest) error {
+	p.calls = append(p.calls, "contacts")
+	p.contactSnapshots = append(p.contactSnapshots, snapshot)
+	return nil
+}
+
+type fakeAdminReader struct {
+	keys     []APIKeyView
+	events   []StoredEventView
+	messages []StoredEventView
+	modules  []ModuleStatusView
+	contacts []ModuleContactView
+	calls    []string
+}
+
+func (r *fakeAdminReader) ListAPIKeys(_ context.Context, limit int) ([]APIKeyView, error) {
+	r.calls = append(r.calls, "keys:"+strconv.Itoa(limit))
+	return r.keys, nil
+}
+
+func (r *fakeAdminReader) ListStoredEvents(_ context.Context, limit int) ([]StoredEventView, error) {
+	r.calls = append(r.calls, "events:"+strconv.Itoa(limit))
+	return r.events, nil
+}
+
+func (r *fakeAdminReader) ListMessages(_ context.Context, filter MessageFilter) ([]StoredEventView, error) {
+	r.calls = append(r.calls, "messages:"+filter.Device+":"+filter.WxID+":"+strconv.Itoa(filter.Limit))
+	return r.messages, nil
+}
+
+func (r *fakeAdminReader) ListModuleStatuses(_ context.Context) ([]ModuleStatusView, error) {
+	r.calls = append(r.calls, "modules")
+	return r.modules, nil
+}
+
+func (r *fakeAdminReader) ListModuleContacts(_ context.Context, filter ModuleContactFilter) ([]ModuleContactView, error) {
+	r.calls = append(r.calls, "contacts:"+filter.Device+":"+filter.Query+":"+strconv.Itoa(filter.Limit))
+	return r.contacts, nil
+}
+
+type fakeOutbox struct {
+	nextID int64
+	items  []ModuleOutboxItem
+}
+
+func (o *fakeOutbox) EnqueueReply(_ context.Context, action ReplyAction) (ModuleOutboxItem, error) {
+	o.nextID++
+	item := ModuleOutboxItem{
+		ID:        o.nextID,
+		Device:    action.Device,
+		OwnerWxID: action.OwnerWxID,
+		WxID:      action.WxID,
+		Text:      action.Text,
+		Status:    "pending",
+	}
+	o.items = append(o.items, item)
+	return item, nil
+}
+
+func (o *fakeOutbox) PollReplyActions(_ context.Context, req ModulePollRequest) ([]ModuleOutboxItem, error) {
+	limit := req.Limit
+	if limit <= 0 || limit > len(o.items) {
+		limit = len(o.items)
+	}
+	out := []ModuleOutboxItem{}
+	for i := range o.items {
+		if len(out) >= limit {
+			break
+		}
+		if o.items[i].Device != req.Device {
+			continue
+		}
+		if req.WxID != "" && o.items[i].OwnerWxID != "" && o.items[i].OwnerWxID != req.WxID {
+			continue
+		}
+		if o.items[i].Status != "pending" {
+			continue
+		}
+		o.items[i].Status = "leased"
+		o.items[i].AttemptCount++
+		out = append(out, o.items[i])
+	}
+	return out, nil
+}
+
+func (o *fakeOutbox) AckReplyActions(_ context.Context, req ModuleAckRequest) ([]ModuleOutboxItem, error) {
+	byID := map[int64]ModuleAckItem{}
+	for _, ack := range req.Items {
+		byID[ack.ID] = ack
+	}
+	out := []ModuleOutboxItem{}
+	for i := range o.items {
+		ack, ok := byID[o.items[i].ID]
+		if !ok || o.items[i].Device != req.Device {
+			continue
+		}
+		if req.WxID != "" && o.items[i].OwnerWxID != "" && o.items[i].OwnerWxID != req.WxID {
+			continue
+		}
+		o.items[i].Status = ack.Status
+		o.items[i].LastError = ack.Error
+		o.items[i].ChatRecordID = ack.ChatRecordID
+		out = append(out, o.items[i])
+	}
+	return out, nil
+}
+
+func dialTestWebSocket(t *testing.T, serverURL string, path string) *wsConn {
+	t.Helper()
+	parsed, err := url.Parse(serverURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("tcp", parsed.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyBytes := make([]byte, 16)
+	if _, err := rand.Read(keyBytes); err != nil {
+		t.Fatal(err)
+	}
+	key := base64.StdEncoding.EncodeToString(keyBytes)
+	request := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\n\r\n", path, parsed.Host, key)
+	if _, err := conn.Write([]byte(request)); err != nil {
+		_ = conn.Close()
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	status, err := reader.ReadString('\n')
+	if err != nil {
+		_ = conn.Close()
+		t.Fatal(err)
+	}
+	if !strings.Contains(status, "101") {
+		_ = conn.Close()
+		t.Fatalf("unexpected websocket status: %s", status)
+	}
+	accept := ""
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			_ = conn.Close()
+			t.Fatal(err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "" {
+			break
+		}
+		name, value, ok := strings.Cut(line, ":")
+		if ok && strings.EqualFold(strings.TrimSpace(name), "Sec-WebSocket-Accept") {
+			accept = strings.TrimSpace(value)
+		}
+	}
+	if accept != websocketAccept(key) {
+		_ = conn.Close()
+		t.Fatalf("unexpected websocket accept %q", accept)
+	}
+	return &wsConn{
+		conn: conn,
+		rw:   bufio.NewReadWriter(reader, bufio.NewWriter(conn)),
+	}
+}
+
+func readTestWSMessage(t *testing.T, conn *wsConn) outboxWSMessage {
+	t.Helper()
+	if err := conn.conn.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		payload, op, err := conn.readFrame()
+		if err != nil {
+			t.Fatal(err)
+		}
+		switch op {
+		case wsOpText:
+			var msg outboxWSMessage
+			if err := json.Unmarshal(payload, &msg); err != nil {
+				t.Fatal(err)
+			}
+			return msg
+		case wsOpPing:
+			if !conn.writeControl(wsOpPong, payload) {
+				t.Fatal("failed to write pong")
+			}
+		}
+	}
+}
+
+func readTestWSMessageOfType(t *testing.T, conn *wsConn, typ string) outboxWSMessage {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		msg := readTestWSMessage(t, conn)
+		if msg.Type == typ {
+			return msg
+		}
+	}
+	t.Fatalf("websocket message type %q was not received", typ)
+	return outboxWSMessage{}
+}

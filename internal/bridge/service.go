@@ -1,0 +1,650 @@
+package bridge
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"wechat-observatory/internal/config"
+)
+
+type Service struct {
+	cfg         Config
+	hub         *Hub
+	persistence Persistence
+	outbox      Outbox
+	adminReader AdminReader
+	mediaDir    string
+
+	mu               sync.RWMutex
+	nextChatRecordID int64
+
+	outboxNotifyMu sync.Mutex
+	outboxNotify   map[string]map[chan struct{}]struct{}
+}
+
+const maxOutboxPollBatch = 1
+
+type Config struct {
+	DefaultDevice string
+	MediaDir      string
+	Devices       map[string]config.Device
+	APIKeys       map[string]config.APIKey
+}
+
+func NewService(cfg Config, opts ...Option) *Service {
+	service := &Service{
+		cfg:              cfg,
+		hub:              NewHub(500),
+		outbox:           NewMemoryOutbox(),
+		outboxNotify:     map[string]map[chan struct{}]struct{}{},
+		nextChatRecordID: time.Now().Unix() * 1000,
+		mediaDir:         strings.TrimSpace(cfg.MediaDir),
+	}
+	for _, opt := range opts {
+		opt(service)
+	}
+	return service
+}
+
+func (s *Service) Hub() *Hub {
+	return s.hub
+}
+
+func (s *Service) DefaultDevice() string {
+	return s.cfg.DefaultDevice
+}
+
+func (s *Service) Device(name string) (config.Device, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	device, ok := s.cfg.Devices[name]
+	return device, ok
+}
+
+func (s *Service) Devices() []config.Device {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]config.Device, 0, len(s.cfg.Devices))
+	for _, device := range s.cfg.Devices {
+		out = append(out, device)
+	}
+	return out
+}
+
+func (s *Service) APIKeys() []config.APIKey {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]config.APIKey, 0, len(s.cfg.APIKeys))
+	for _, key := range s.cfg.APIKeys {
+		out = append(out, key)
+	}
+	return out
+}
+
+func (s *Service) AdminReader() AdminReader {
+	return s.adminReader
+}
+
+func (s *Service) AdminWriter() AdminWriter {
+	if writer, ok := s.persistence.(AdminWriter); ok {
+		return writer
+	}
+	return nil
+}
+
+func (s *Service) UpsertAPIKey(ctx context.Context, req APIKeyUpsertRequest) (APIKeyView, error) {
+	key := config.APIKey{
+		Code:     firstNonEmpty(req.APIKey, req.Code),
+		Device:   strings.TrimSpace(req.Device),
+		Nickname: strings.TrimSpace(req.Nickname),
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cfg.APIKeys == nil {
+		s.cfg.APIKeys = map[string]config.APIKey{}
+	}
+	if key.Code == "" {
+		for i := 0; i < 5; i++ {
+			key.Code = generateAPIKey()
+			if _, exists := s.cfg.APIKeys[key.Code]; !exists {
+				break
+			}
+		}
+		if _, exists := s.cfg.APIKeys[key.Code]; exists {
+			return APIKeyView{}, fmt.Errorf("failed to generate unique api key")
+		}
+	}
+	if key.Device == "" {
+		key.Device = apiKeyDeviceName(key)
+	}
+	if writer := s.AdminWriter(); writer != nil {
+		if err := writer.UpsertAPIKey(ctx, key); err != nil {
+			return APIKeyView{}, err
+		}
+	}
+	s.cfg.APIKeys[key.Code] = key
+	return apiKeyView(key), nil
+}
+
+func (s *Service) DeleteAPIKey(ctx context.Context, apiKey string) error {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return fmt.Errorf("api key is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.cfg.APIKeys[apiKey]; !ok {
+		return fmt.Errorf("api key %q not found", apiKey)
+	}
+	if writer := s.AdminWriter(); writer != nil {
+		if err := writer.DeleteAPIKey(ctx, apiKey); err != nil {
+			return err
+		}
+	}
+	delete(s.cfg.APIKeys, apiKey)
+	return nil
+}
+
+func (s *Service) SetAPIKeyEnabled(ctx context.Context, apiKey string, enabled bool) (APIKeyView, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return APIKeyView{}, fmt.Errorf("api key is required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, ok := s.cfg.APIKeys[apiKey]
+	if !ok {
+		return APIKeyView{}, fmt.Errorf("api key %q not found", apiKey)
+	}
+	key.Disabled = !enabled
+	if writer := s.AdminWriter(); writer != nil {
+		if err := writer.SetAPIKeyEnabled(ctx, apiKey, enabled); err != nil {
+			return APIKeyView{}, err
+		}
+	}
+	s.cfg.APIKeys[apiKey] = key
+	return apiKeyView(key), nil
+}
+
+func (s *Service) UpsertDevice(ctx context.Context, req DeviceUpsertRequest) (ModuleStatusView, error) {
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return ModuleStatusView{}, fmt.Errorf("device name is required")
+	}
+	nickname := strings.TrimSpace(req.Nickname)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	device, ok := s.cfg.Devices[name]
+	if !ok {
+		return ModuleStatusView{}, fmt.Errorf("unknown device %q", name)
+	}
+	device.Nickname = firstNonEmpty(nickname, device.Nickname, device.Name)
+	if writer := s.AdminWriter(); writer != nil {
+		if err := writer.UpsertDevice(ctx, device); err != nil {
+			return ModuleStatusView{}, err
+		}
+	}
+	s.cfg.Devices[name] = device
+	status := ModuleStatusView{
+		Device:         device.Name,
+		DeviceWxID:     device.WxID,
+		DeviceNickname: device.Nickname,
+		Enabled:        true,
+	}
+	if strings.TrimSpace(device.WxID) != "" {
+		status.Registered = true
+	}
+	status.NormalizeRuntimeStatus()
+	return status, nil
+}
+
+func (s *Service) RegisterModule(ctx context.Context, req ModuleRegistrationRequest) (*ModuleRegistrationResult, error) {
+	req, err := req.Validate(s.cfg.DefaultDevice)
+	if err != nil {
+		return nil, err
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key, ok := s.cfg.APIKeys[req.APIKey]
+	if !ok {
+		return nil, fmt.Errorf("invalid api key")
+	}
+	if key.Disabled {
+		return nil, fmt.Errorf("api key disabled")
+	}
+	deviceName := apiKeyDeviceName(key)
+	req.Device = deviceName
+	if strings.TrimSpace(req.Device) == "" {
+		return nil, fmt.Errorf("device is required")
+	}
+	if key.Device != req.Device {
+		key.Device = req.Device
+		if writer := s.AdminWriter(); writer != nil {
+			if err := writer.UpsertAPIKey(ctx, key); err != nil {
+				return nil, err
+			}
+		}
+		s.cfg.APIKeys[key.Code] = key
+	}
+	device := s.cfg.Devices[req.Device]
+	if strings.TrimSpace(device.Name) == "" {
+		device.Name = req.Device
+		device.Timeout = 5 * time.Second
+	}
+	device.WxID = req.WxID
+	device.Nickname = firstNonEmpty(device.Nickname, key.Nickname, req.Nickname, device.Name)
+	if s.persistence != nil {
+		if err := s.persistence.UpdateDeviceIdentity(ctx, req.Device, device.WxID, device.Nickname); err != nil {
+			return nil, err
+		}
+	}
+	s.recordModuleActivity(ctx, ModuleActivity{
+		Device: req.Device,
+		WxID:   req.WxID,
+		APIKey: req.APIKey,
+		Kind:   "register",
+	})
+	s.cfg.Devices[req.Device] = device
+	return &ModuleRegistrationResult{
+		Device: moduleDeviceView(device),
+	}, nil
+}
+
+func (s *Service) Ingest(ctx context.Context, event MessageEvent) (*IngestResult, error) {
+	auth, err := s.authorizeModuleAPIKey(event.APIKey)
+	if err != nil {
+		return nil, err
+	}
+	if event.Device == "" {
+		event.Device = auth.Device
+	}
+	if event.Direction == "" {
+		event.Direction = DirectionRecv
+	}
+	if event.MessageType == 0 {
+		event.MessageType = 1
+	}
+	if event.CreateTime == 0 {
+		event.CreateTime = time.Now().Unix()
+	}
+	event = event.Normalize()
+	mediaError := ""
+	if stored, err := s.StoreMediaAttachment(event); err != nil {
+		event.MediaBase64 = ""
+		mediaError = err.Error()
+	} else {
+		event = stored
+	}
+	event.APIKey = ""
+	if err := event.Validate(); err != nil {
+		return nil, err
+	}
+	event.Device = auth.Device
+	if ownerWxID := s.deviceWxID(event.Device); ownerWxID != "" {
+		event.OwnerWxID = ownerWxID
+	}
+
+	s.hub.Publish(event)
+	result := &IngestResult{Published: true}
+	if mediaError != "" {
+		result.PersistenceError = "media: " + mediaError
+	}
+	if s.persistence != nil {
+		if err := s.persistence.RecordInboundEvent(ctx, event); err != nil {
+			result.PersistenceError = err.Error()
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) SendText(ctx context.Context, req SendTextRequest) (int64, error) {
+	req, err := req.Validate(s.cfg.DefaultDevice)
+	if err != nil {
+		return 0, err
+	}
+	if _, ok := s.Device(req.Device); !ok {
+		return 0, fmt.Errorf("unknown device %q", req.Device)
+	}
+	ownerWxID := s.deviceWxID(req.Device)
+	if req.OwnerWxID != "" && req.OwnerWxID != ownerWxID {
+		return 0, fmt.Errorf("send owner wxid %q is not current device wxid", req.OwnerWxID)
+	}
+	firstID := int64(0)
+	for _, wxid := range req.WxIDs {
+		item, err := s.outbox.EnqueueReply(ctx, ReplyAction{
+			Device:    req.Device,
+			OwnerWxID: ownerWxID,
+			WxID:      wxid,
+			Text:      req.Text,
+		})
+		if err != nil {
+			return 0, err
+		}
+		if firstID == 0 {
+			firstID = item.ID
+		}
+	}
+	s.notifyOutbox(req.Device)
+	return firstID, nil
+}
+
+func (s *Service) PollOutbox(ctx context.Context, req ModulePollRequest) ([]ModuleOutboxItem, error) {
+	req, err := req.Validate(s.cfg.DefaultDevice)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := s.authorizeModuleAPIKey(req.APIKey)
+	if err != nil {
+		return nil, err
+	}
+	req.Device = auth.Device
+	currentWxID := s.deviceWxID(req.Device)
+	if req.WxID == "" {
+		req.WxID = currentWxID
+	}
+	if currentWxID != "" && req.WxID != "" && currentWxID != req.WxID {
+		return nil, fmt.Errorf("module wxid %q is not current device wxid", req.WxID)
+	}
+	if req.Limit > maxOutboxPollBatch {
+		req.Limit = maxOutboxPollBatch
+	}
+	items, err := s.outbox.PollReplyActions(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	s.recordModuleActivity(ctx, ModuleActivity{
+		Device:        req.Device,
+		WxID:          req.WxID,
+		APIKey:        req.APIKey,
+		Kind:          "poll",
+		PollLimit:     req.Limit,
+		PollItemCount: len(items),
+	})
+	return items, nil
+}
+
+func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]ModuleOutboxItem, error) {
+	req, err := req.Validate(s.cfg.DefaultDevice)
+	if err != nil {
+		return nil, err
+	}
+	auth, err := s.authorizeModuleAPIKey(req.APIKey)
+	if err != nil {
+		return nil, err
+	}
+	req.Device = auth.Device
+	currentWxID := s.deviceWxID(req.Device)
+	if req.WxID == "" {
+		req.WxID = currentWxID
+	}
+	if currentWxID != "" && req.WxID != "" && currentWxID != req.WxID {
+		return nil, fmt.Errorf("module wxid %q is not current device wxid", req.WxID)
+	}
+	items, err := s.outbox.AckReplyActions(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	s.recordModuleActivity(ctx, ackActivity(req))
+	acks := map[int64]ModuleAckItem{}
+	for _, ack := range req.Items {
+		acks[ack.ID] = ack
+	}
+	for _, item := range items {
+		ack := acks[item.ID]
+		if ack.Status != "sent" {
+			continue
+		}
+		recordID := ack.ChatRecordID
+		if recordID <= 0 {
+			recordID = s.nextRecordID()
+		}
+		event := MessageEvent{
+			ID:           strconv.FormatInt(recordID, 10),
+			EventID:      recordID,
+			ChatRecordID: recordID,
+			Device:       item.Device,
+			OwnerWxID:    firstNonEmpty(item.OwnerWxID, s.deviceWxID(item.Device)),
+			From:         s.deviceWxID(item.Device),
+			To:           item.WxID,
+			Text:         item.Text,
+			MessageType:  1,
+			Direction:    DirectionSent,
+			CreateTime:   time.Now().Unix(),
+			RawProvider:  RawProviderModuleAck,
+		}.Normalize()
+		s.hub.Publish(event)
+		if s.persistence != nil {
+			_ = s.persistence.RecordOutboundEvent(ctx, event)
+		}
+	}
+	return items, nil
+}
+
+func (s *Service) RecordModuleContacts(ctx context.Context, req ModuleContactSnapshotRequest) (int, error) {
+	req, err := req.Validate(s.cfg.DefaultDevice)
+	if err != nil {
+		return 0, err
+	}
+	auth, err := s.authorizeModuleAPIKey(req.APIKey)
+	if err != nil {
+		return 0, err
+	}
+	req.Device = auth.Device
+	if req.WxID == "" {
+		req.WxID = s.deviceWxID(req.Device)
+	}
+	if s.persistence == nil {
+		return len(req.Contacts), nil
+	}
+	store, ok := s.persistence.(ModuleContactStore)
+	if !ok {
+		return len(req.Contacts), nil
+	}
+	if err := store.RecordModuleContacts(ctx, req); err != nil {
+		return 0, err
+	}
+	return len(req.Contacts), nil
+}
+
+func (s *Service) recordModuleActivity(ctx context.Context, activity ModuleActivity) {
+	if s.persistence == nil {
+		return
+	}
+	recorder, ok := s.persistence.(ModuleActivityRecorder)
+	if !ok {
+		return
+	}
+	_ = recorder.RecordModuleActivity(ctx, activity)
+}
+
+func (s *Service) subscribeOutbox(device string) (<-chan struct{}, func()) {
+	device = strings.TrimSpace(device)
+	ch := make(chan struct{}, 1)
+	s.outboxNotifyMu.Lock()
+	if s.outboxNotify[device] == nil {
+		s.outboxNotify[device] = map[chan struct{}]struct{}{}
+	}
+	s.outboxNotify[device][ch] = struct{}{}
+	s.outboxNotifyMu.Unlock()
+	unsubscribe := func() {
+		s.outboxNotifyMu.Lock()
+		if subscribers := s.outboxNotify[device]; subscribers != nil {
+			delete(subscribers, ch)
+			if len(subscribers) == 0 {
+				delete(s.outboxNotify, device)
+			}
+		}
+		s.outboxNotifyMu.Unlock()
+	}
+	return ch, unsubscribe
+}
+
+func (s *Service) notifyOutbox(device string) {
+	device = strings.TrimSpace(device)
+	s.outboxNotifyMu.Lock()
+	defer s.outboxNotifyMu.Unlock()
+	for ch := range s.outboxNotify[device] {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func ackActivity(req ModuleAckRequest) ModuleActivity {
+	activity := ModuleActivity{
+		Device: req.Device,
+		Kind:   "ack",
+	}
+	for _, item := range req.Items {
+		switch item.Status {
+		case "failed":
+			activity.AckFailedCount++
+			if activity.LastError == "" {
+				activity.LastError = item.Error
+			}
+		case "sent":
+			activity.AckSentCount++
+		}
+	}
+	return activity
+}
+
+func (s *Service) deviceWxID(deviceName string) string {
+	if device, ok := s.Device(deviceName); ok {
+		return device.WxID
+	}
+	return ""
+}
+
+type moduleAPIKeyAuth struct {
+	Key    config.APIKey
+	Device string
+}
+
+func (s *Service) authorizeModuleAPIKey(apiKey string) (moduleAPIKeyAuth, error) {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return moduleAPIKeyAuth{}, fmt.Errorf("api_key is required")
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	key, ok := s.cfg.APIKeys[apiKey]
+	if !ok {
+		return moduleAPIKeyAuth{}, fmt.Errorf("invalid api key")
+	}
+	if key.Disabled {
+		return moduleAPIKeyAuth{}, fmt.Errorf("api key disabled")
+	}
+	device := apiKeyDeviceName(key)
+	if strings.TrimSpace(device) == "" {
+		return moduleAPIKeyAuth{}, fmt.Errorf("device is required")
+	}
+	if _, ok := s.cfg.Devices[device]; !ok {
+		return moduleAPIKeyAuth{}, fmt.Errorf("unknown device %q", device)
+	}
+	return moduleAPIKeyAuth{Key: key, Device: device}, nil
+}
+
+func (s *Service) nextRecordID() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.nextChatRecordID++
+	return s.nextChatRecordID
+}
+
+type IngestResult struct {
+	Published        bool   `json:"published"`
+	PersistenceError string `json:"persistence_error,omitempty"`
+}
+
+type ReplyAction struct {
+	Device       string `json:"device"`
+	OwnerWxID    string `json:"owner_wxid,omitempty"`
+	WxID         string `json:"wxid"`
+	Text         string `json:"text"`
+	ChatRecordID int64  `json:"chat_record_id,omitempty"`
+	Error        string `json:"error,omitempty"`
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func apiKeyView(key config.APIKey) APIKeyView {
+	return APIKeyView{
+		Code:     key.Code,
+		APIKey:   key.Code,
+		Device:   key.Device,
+		Nickname: key.Nickname,
+		Enabled:  !key.Disabled,
+	}
+}
+
+func generateAPIKey() string {
+	random := make([]byte, 16)
+	if _, err := rand.Read(random); err != nil {
+		return fmt.Sprintf("wg_%d", time.Now().UnixNano())
+	}
+	return "wg_" + hex.EncodeToString(random)
+}
+
+func safeCodePart(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var builder strings.Builder
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z':
+			builder.WriteRune(r)
+		case r >= '0' && r <= '9':
+			builder.WriteRune(r)
+		case r == '-' || r == '_':
+			builder.WriteRune(r)
+		}
+	}
+	if builder.Len() == 0 {
+		return "code"
+	}
+	return builder.String()
+}
+
+type ModuleRegistrationResult struct {
+	Device ModuleDeviceView `json:"device"`
+}
+
+type ModuleDeviceView struct {
+	Name     string `json:"name"`
+	WxID     string `json:"wxid,omitempty"`
+	Nickname string `json:"nickname,omitempty"`
+}
+
+func apiKeyDeviceName(key config.APIKey) string {
+	if value := strings.TrimSpace(key.Device); value != "" {
+		return value
+	}
+	return "device-" + safeCodePart(key.Code)
+}
+
+func moduleDeviceView(device config.Device) ModuleDeviceView {
+	return ModuleDeviceView{
+		Name:     device.Name,
+		WxID:     device.WxID,
+		Nickname: device.Nickname,
+	}
+}

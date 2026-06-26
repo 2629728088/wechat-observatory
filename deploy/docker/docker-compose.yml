@@ -1,0 +1,39 @@
+﻿services:
+  gateway:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: wechat-observatory:local
+    container_name: wechat-observatory
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      BRIDGE_HTTP_ADDR: "${BRIDGE_HTTP_ADDR:-:8088}"
+      BRIDGE_MYSQL_AUTO_MIGRATE: "false"
+      BRIDGE_MEDIA_DIR: "${BRIDGE_MEDIA_DIR:-/var/lib/wechat-observatory/media}"
+    volumes:
+      - gateway-media:/var/lib/wechat-observatory/media
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8088/healthz"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  gateway-db:
+    image: wechat-observatory:local
+    container_name: wechat-observatory-db
+    profiles:
+      - tools
+    network_mode: host
+    env_file:
+      - path: .env
+        required: false
+    entrypoint: ["/usr/local/bin/wechat-observatory-db"]
+    command: ["-create-database", "-migrate", "-seed", "-check"]
+
+volumes:
+  gateway-media:

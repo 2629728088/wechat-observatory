@@ -30,7 +30,7 @@ type Service struct {
 	outboxNotify   map[string]map[chan struct{}]struct{}
 }
 
-const maxOutboxPollBatch = 1
+const maxOutboxPollBatch = 20
 
 type Config struct {
 	DefaultDevice string
@@ -297,17 +297,72 @@ func (s *Service) Ingest(ctx context.Context, event MessageEvent) (*IngestResult
 		event.OwnerWxID = ownerWxID
 	}
 
-	s.hub.Publish(event)
-	result := &IngestResult{Published: true}
+	alreadyStored, lookupErr := s.messageEventAlreadyStored(ctx, event)
+	mediaEnriched, mediaLookupErr := s.messageEventMediaEnriched(ctx, event, alreadyStored)
+	result := &IngestResult{}
 	if mediaError != "" {
 		result.PersistenceError = "media: " + mediaError
 	}
+	if lookupErr != nil {
+		result.PersistenceError = appendPersistenceError(result.PersistenceError, lookupErr.Error())
+	}
+	if mediaLookupErr != nil {
+		result.PersistenceError = appendPersistenceError(result.PersistenceError, mediaLookupErr.Error())
+	}
+	recorded := true
 	if s.persistence != nil {
 		if err := s.persistence.RecordInboundEvent(ctx, event); err != nil {
-			result.PersistenceError = err.Error()
+			recorded = false
+			result.PersistenceError = appendPersistenceError(result.PersistenceError, err.Error())
 		}
 	}
+	if !alreadyStored || mediaEnriched || !recorded {
+		s.hub.Publish(event)
+		result.Published = true
+	}
 	return result, nil
+}
+
+func (s *Service) messageEventAlreadyStored(ctx context.Context, event MessageEvent) (bool, error) {
+	if s.persistence == nil || event.ChatRecordID <= 0 || messageEventAlwaysPublishes(event) {
+		return false, nil
+	}
+	lookup, ok := s.persistence.(MessageEventLookup)
+	if !ok {
+		return false, nil
+	}
+	return lookup.HasMessageEvent(ctx, event)
+}
+
+func (s *Service) messageEventMediaEnriched(ctx context.Context, event MessageEvent, alreadyStored bool) (bool, error) {
+	if !alreadyStored || strings.TrimSpace(event.MediaURL) == "" {
+		return false, nil
+	}
+	lookup, ok := s.persistence.(MessageEventMediaLookup)
+	if !ok {
+		return false, nil
+	}
+	hasMedia, err := lookup.HasMessageEventMedia(ctx, event)
+	if err != nil {
+		return false, err
+	}
+	return !hasMedia, nil
+}
+
+func messageEventAlwaysPublishes(event MessageEvent) bool {
+	return strings.TrimSpace(event.MessageKind) == MessageKindSystem &&
+		strings.TrimSpace(event.AppMsgSubtype) == SystemSubtypeRevoke
+}
+
+func appendPersistenceError(current string, next string) string {
+	next = strings.TrimSpace(next)
+	if next == "" {
+		return current
+	}
+	if current == "" {
+		return next
+	}
+	return current + "; " + next
 }
 
 func (s *Service) SendText(ctx context.Context, req SendTextRequest) (int64, error) {
@@ -325,28 +380,39 @@ func (s *Service) SendText(ctx context.Context, req SendTextRequest) (int64, err
 }
 
 func (s *Service) SendAction(ctx context.Context, req SendActionRequest) (int64, error) {
-	req, err := req.Validate(s.cfg.DefaultDevice)
+	items, err := s.SendActions(ctx, req)
 	if err != nil {
 		return 0, err
 	}
+	if len(items) == 0 {
+		return 0, nil
+	}
+	return items[0].ID, nil
+}
+
+func (s *Service) SendActions(ctx context.Context, req SendActionRequest) ([]ModuleOutboxItem, error) {
+	req, err := req.Validate(s.cfg.DefaultDevice)
+	if err != nil {
+		return nil, err
+	}
 	if _, ok := s.Device(req.Device); !ok {
-		return 0, fmt.Errorf("unknown device %q", req.Device)
+		return nil, fmt.Errorf("unknown device %q", req.Device)
 	}
 	ownerWxID := s.deviceWxID(req.Device)
 	if req.OwnerWxID != "" && req.OwnerWxID != ownerWxID {
-		return 0, fmt.Errorf("send owner wxid %q is not current device wxid", req.OwnerWxID)
+		return nil, fmt.Errorf("send owner wxid %q is not current device wxid", req.OwnerWxID)
 	}
 	if isMediaOutboxKind(req.Kind) {
 		req, err = s.prepareMediaAction(req, ownerWxID)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 	}
 	payloadJSON, err := actionPayloadJSON(req)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	firstID := int64(0)
+	items := make([]ModuleOutboxItem, 0, len(req.WxIDs))
 	for _, wxid := range req.WxIDs {
 		item, err := s.outbox.EnqueueReply(ctx, ReplyAction{
 			Device:      req.Device,
@@ -362,14 +428,12 @@ func (s *Service) SendAction(ctx context.Context, req SendActionRequest) (int64,
 			MediaSize:   req.MediaSize,
 		})
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
-		if firstID == 0 {
-			firstID = item.ID
-		}
+		items = append(items, item)
 	}
 	s.notifyOutbox(req.Device)
-	return firstID, nil
+	return items, nil
 }
 
 func (s *Service) OutboxItem(ctx context.Context, id int64) (ModuleOutboxItem, error) {
@@ -546,6 +610,15 @@ func actionPayloadJSON(req SendActionRequest) (json.RawMessage, error) {
 	if len(req.SourceChatRecordIDs) > 0 {
 		payload["source_chat_record_ids"] = req.SourceChatRecordIDs
 	}
+	if req.TargetChatRecordID > 0 {
+		payload["target_chat_record_id"] = req.TargetChatRecordID
+	}
+	if req.TargetMsgSvrID > 0 {
+		payload["target_msg_svr_id"] = req.TargetMsgSvrID
+	}
+	if req.RevokeTicket != "" {
+		payload["revoke_ticket"] = req.RevokeTicket
+	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
@@ -572,6 +645,12 @@ type appMsgOutboxPayload struct {
 type locationOutboxPayload struct {
 	LocationLabel   string `json:"location_label"`
 	LocationPoiName string `json:"location_poiname"`
+}
+
+type revokeOutboxPayload struct {
+	TargetChatRecordID int64  `json:"target_chat_record_id"`
+	TargetMsgSvrID     int64  `json:"target_msg_svr_id"`
+	RevokeTicket       string `json:"revoke_ticket"`
 }
 
 func appMsgPayloadFromRaw(raw json.RawMessage) appMsgOutboxPayload {
@@ -616,6 +695,18 @@ func locationPayloadFromRaw(raw json.RawMessage) locationOutboxPayload {
 	}
 	payload.LocationLabel = strings.TrimSpace(payload.LocationLabel)
 	payload.LocationPoiName = strings.TrimSpace(payload.LocationPoiName)
+	return payload
+}
+
+func revokePayloadFromRaw(raw json.RawMessage) revokeOutboxPayload {
+	if len(raw) == 0 {
+		return revokeOutboxPayload{}
+	}
+	var payload revokeOutboxPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return revokeOutboxPayload{}
+	}
+	payload.RevokeTicket = strings.TrimSpace(payload.RevokeTicket)
 	return payload
 }
 
@@ -686,7 +777,7 @@ func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]Module
 			continue
 		}
 		recordID := ack.ChatRecordID
-		if recordID <= 0 {
+		if isRevokeOutboxItem(item) || recordID <= 0 {
 			recordID = s.nextRecordID()
 		}
 		event := MessageEvent{
@@ -715,7 +806,14 @@ func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]Module
 			CreateTime:        time.Now().Unix(),
 			RawProvider:       RawProviderModuleAck,
 		}
-		if isChatHistoryOutboxItem(item) {
+		if isRevokeOutboxItem(item) {
+			event.MessageKind = MessageKindSystem
+			event.AppMsgSubtype = SystemSubtypeRevoke
+			event.MessageType = 10000
+			event.RawXML = outboundRevokeRawXML(item)
+			event.Evidence = appendUnique(event.Evidence, "message.type=10000", "outbox.kind=revoke")
+			event = event.Normalize()
+		} else if isChatHistoryOutboxItem(item) {
 			event.MessageKind = MessageKindChatHistory
 			event.Evidence = appendUnique(event.Evidence, "message.type=49", "outbox.kind=chat_history")
 			if event.Text == "" {
@@ -730,9 +828,15 @@ func (s *Service) AckOutbox(ctx context.Context, req ModuleAckRequest) ([]Module
 		} else {
 			event = event.Normalize()
 		}
-		s.hub.Publish(event)
+		alreadyStored, lookupErr := s.messageEventAlreadyStored(ctx, event)
+		recorded := true
 		if s.persistence != nil {
-			_ = s.persistence.RecordOutboundEvent(ctx, event)
+			if err := s.persistence.RecordOutboundEvent(ctx, event); err != nil {
+				recorded = false
+			}
+		}
+		if lookupErr != nil || !alreadyStored || !recorded {
+			s.hub.Publish(event)
 		}
 	}
 	return items, nil
@@ -761,10 +865,16 @@ func outboundText(item ModuleOutboxItem) string {
 		payload := locationPayloadFromRaw(item.PayloadJSON)
 		return firstNonEmpty(payload.LocationLabel, payload.LocationPoiName, "[位置]")
 	}
+	if isRevokeOutboxItem(item) {
+		return "[撤回]"
+	}
 	return item.Text
 }
 
 func outboundMessageType(item ModuleOutboxItem) int32 {
+	if isRevokeOutboxItem(item) {
+		return 10000
+	}
 	if isVideoOutboxItem(item) {
 		return 43
 	}
@@ -823,6 +933,9 @@ func outboundAppMsgSubtype(item ModuleOutboxItem) string {
 	}
 	if isMiniProgramOutboxItem(item) {
 		return "mini_program"
+	}
+	if isRevokeOutboxItem(item) {
+		return SystemSubtypeRevoke
 	}
 	return ""
 }
@@ -915,6 +1028,34 @@ func isMiniProgramOutboxItem(item ModuleOutboxItem) bool {
 
 func isChatHistoryOutboxItem(item ModuleOutboxItem) bool {
 	return item.Kind == OutboxKindChatHistory
+}
+
+func isRevokeOutboxItem(item ModuleOutboxItem) bool {
+	return item.Kind == OutboxKindRevoke
+}
+
+func outboundRevokeRawXML(item ModuleOutboxItem) string {
+	payload := revokePayloadFromRaw(item.PayloadJSON)
+	targetID := firstPositiveLong(payload.TargetChatRecordID, item.ChatRecordID)
+	targetSvrID := payload.TargetMsgSvrID
+	replacemsg := firstNonEmpty(item.Text, "撤回了一条消息")
+	return "<sysmsg type=\"revokemsg\"><revokemsg>" +
+		"<session>" + xmlEscapeText(item.WxID) + "</session>" +
+		"<oldmsgid>" + strconv.FormatInt(targetID, 10) + "</oldmsgid>" +
+		"<msgid>" + strconv.FormatInt(targetID, 10) + "</msgid>" +
+		"<newmsgid>" + strconv.FormatInt(targetSvrID, 10) + "</newmsgid>" +
+		"<replacemsg>" + xmlEscapeText(replacemsg) + "</replacemsg>" +
+		"</revokemsg></sysmsg>"
+}
+
+func xmlEscapeText(value string) string {
+	return strings.NewReplacer(
+		"&", "&amp;",
+		"<", "&lt;",
+		">", "&gt;",
+		`"`, "&quot;",
+		"'", "&#39;",
+	).Replace(value)
 }
 
 func defaultOutboxMediaText(kind string) string {

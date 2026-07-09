@@ -90,15 +90,6 @@ def skip_step(name: str, detail: str) -> StepResult:
 def android_build_command() -> tuple[list[str], Path] | None:
     if not ANDROID_MODULE.is_dir():
         return None
-    if os.name == "nt":
-        wrapper = ANDROID_MODULE / "gradlew.bat"
-        if wrapper.is_file():
-            return [str(wrapper), ":app:assembleDebug"], ANDROID_MODULE
-    else:
-        wrapper = ANDROID_MODULE / "gradlew"
-        if wrapper.is_file():
-            return [str(wrapper), ":app:assembleDebug"], ANDROID_MODULE
-
     gradle_bin = os.environ.get("GRADLE_BIN", "")
     if gradle_bin and Path(gradle_bin).is_file():
         return [gradle_bin, ":app:assembleDebug"], ANDROID_MODULE
@@ -109,6 +100,15 @@ def android_build_command() -> tuple[list[str], Path] | None:
     for path in gradle_candidate_paths():
         if path.is_file():
             return [str(path), ":app:assembleDebug"], ANDROID_MODULE
+
+    if os.name == "nt":
+        wrapper = ANDROID_MODULE / "gradlew.bat"
+        if wrapper.is_file():
+            return [str(wrapper), ":app:assembleDebug"], ANDROID_MODULE
+    else:
+        wrapper = ANDROID_MODULE / "gradlew"
+        if wrapper.is_file():
+            return [str(wrapper), ":app:assembleDebug"], ANDROID_MODULE
     return None
 
 

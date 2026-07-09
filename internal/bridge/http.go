@@ -62,6 +62,7 @@ func (s *HTTPServer) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/messages/link", s.requirePublicAPI(s.sendV1Message(OutboxKindLink)))
 	mux.HandleFunc("POST /api/v1/messages/mini-program", s.requirePublicAPI(s.sendV1Message(OutboxKindMiniProgram)))
 	mux.HandleFunc("POST /api/v1/messages/chat-history", s.requirePublicAPI(s.sendV1Message(OutboxKindChatHistory)))
+	mux.HandleFunc("POST /api/v1/messages/revoke", s.requirePublicAPI(s.sendV1Message(OutboxKindRevoke)))
 	mux.HandleFunc("GET /api/v1/capabilities", s.requirePublicAPI(s.publicCapabilities))
 	mux.HandleFunc("GET /api/v1/messages", s.requirePublicAPI(s.getV1Messages))
 	mux.HandleFunc("GET /api/v1/ws", s.requirePublicAPI(s.publicWebSocket))
@@ -389,12 +390,12 @@ func (s *HTTPServer) sendText(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "owner_wxid_required", "owner_wxid is required for admin sends")
 		return
 	}
-	recordID, err := s.service.SendText(r.Context(), req)
+	outboxID, err := s.service.SendText(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "send_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "chat_record_id": recordID})
+	writeJSON(w, http.StatusOK, adminSendQueuedResponse(outboxID))
 }
 
 func (s *HTTPServer) sendAction(w http.ResponseWriter, r *http.Request) {
@@ -408,12 +409,21 @@ func (s *HTTPServer) sendAction(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "owner_wxid_required", "owner_wxid is required for admin sends")
 		return
 	}
-	recordID, err := s.service.SendAction(r.Context(), req)
+	outboxID, err := s.service.SendAction(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "send_failed", err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "chat_record_id": recordID, "outbox_id": recordID})
+	writeJSON(w, http.StatusOK, adminSendQueuedResponse(outboxID))
+}
+
+func adminSendQueuedResponse(outboxID int64) map[string]any {
+	return map[string]any{
+		"ok":         true,
+		"outbox_id":  outboxID,
+		"queued":     true,
+		"status_url": publicOutboxStatusURL(outboxID),
+	}
 }
 
 func (s *HTTPServer) registerModule(w http.ResponseWriter, r *http.Request) {

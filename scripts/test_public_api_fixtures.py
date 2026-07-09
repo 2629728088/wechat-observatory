@@ -39,7 +39,7 @@ def minimal_fixture(fixture_id: str = "public-api-v1.text", *, outbound_supporte
                     "json": {"wx_ids": ["target-a"], "text": "hello"},
                 },
                 "send_response": {"protocol_version": "v1", "outbox_id": 10},
-                "outbox_terminal": {"outbox": {"status": "sent"}},
+                "outbox_terminal": {"outbox": {"status": "sent", "chat_record_id": 90001}},
             }
         )
     return data
@@ -137,6 +137,28 @@ class PublicAPIFixtureValidatorTests(unittest.TestCase):
             write_json(root / "public-api-v1.text.json", data)
 
             with self.assertRaisesRegex(SystemExit, "outbox_terminal"):
+                fixtures.validate_fixture_set(root, MINIMAL_REQUIRED_FIXTURE_IDS)
+
+    def test_queued_send_response_must_not_claim_chat_record_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_index(root, ["public-api-v1.text.json"])
+            data = minimal_fixture()
+            data["send_response"]["chat_record_id"] = data["send_response"]["outbox_id"]
+            write_json(root / "public-api-v1.text.json", data)
+
+            with self.assertRaisesRegex(SystemExit, "must not mirror outbox_id"):
+                fixtures.validate_fixture_set(root, MINIMAL_REQUIRED_FIXTURE_IDS)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            write_index(root, ["public-api-v1.text.json"])
+            data = minimal_fixture()
+            data["send_response"]["chat_record_id"] = 99
+            data["send_response"]["outbox"] = {"id": 10, "status": "pending"}
+            write_json(root / "public-api-v1.text.json", data)
+
+            with self.assertRaisesRegex(SystemExit, "must be omitted until module ACK"):
                 fixtures.validate_fixture_set(root, MINIMAL_REQUIRED_FIXTURE_IDS)
 
     def test_inbound_envelope_rejects_legacy_flat_fields(self) -> None:

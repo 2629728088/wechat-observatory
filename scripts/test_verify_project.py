@@ -85,7 +85,7 @@ class VerifyProjectTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "ready module"):
                     verify.resolve_live_api_key(args())
 
-    def test_android_build_command_prefers_project_wrapper_and_reports_missing_tooling(self) -> None:
+    def test_android_build_command_uses_project_wrapper_when_local_gradle_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             android_module = Path(tmp) / "android-module"
             android_module.mkdir(parents=True)
@@ -93,8 +93,11 @@ class VerifyProjectTests(unittest.TestCase):
 
             with patch.object(verify, "ANDROID_MODULE", android_module):
                 with patch.object(verify.os, "name", "posix"):
-                    command = verify.android_build_command()
+                    with patch.object(verify.shutil, "which", return_value=None):
+                        with patch.object(verify, "gradle_candidate_paths", return_value=[]):
+                            command = verify.android_build_command()
             self.assertIsNotNone(command)
+            self.assertEqual(command[0][0], str(android_module / "gradlew"))
             self.assertEqual(command[0][1], ":app:assembleDebug")
             self.assertEqual(command[1], android_module)
 
@@ -103,6 +106,25 @@ class VerifyProjectTests(unittest.TestCase):
                 with patch.object(verify.os, "name", "posix"):
                     with patch.object(verify.shutil, "which", return_value=None):
                         self.assertIsNone(verify.android_build_command())
+
+    def test_android_build_command_prefers_local_gradle_over_wrapper(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            android_module = root / "android-module"
+            android_module.mkdir(parents=True)
+            (android_module / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")
+            gradle = root / "gradle-8.10.2" / "bin" / "gradle"
+            gradle.parent.mkdir(parents=True)
+            gradle.write_text("#!/bin/sh\n", encoding="utf-8")
+
+            with patch.object(verify, "ANDROID_MODULE", android_module):
+                with patch.object(verify.os, "name", "posix"):
+                    with patch.object(verify.shutil, "which", return_value=None):
+                        with patch.object(verify, "gradle_candidate_paths", return_value=[gradle]):
+                            command = verify.android_build_command()
+
+        self.assertIsNotNone(command)
+        self.assertEqual(command[0][0], str(gradle))
 
     def test_android_build_command_uses_env_gradle_and_sdk_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

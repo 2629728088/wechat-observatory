@@ -46,17 +46,12 @@ func (s *HTTPServer) sendV1Message(expectedKind string) http.HandlerFunc {
 			}
 			req.Kind = expectedKind
 		}
-		recordID, err := s.service.SendAction(r.Context(), req)
+		items, err := s.service.SendActions(r.Context(), req)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, "send_failed", err.Error())
 			return
 		}
-		item, err := s.service.OutboxItem(r.Context(), recordID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "outbox_read_failed", err.Error())
-			return
-		}
-		writeJSON(w, http.StatusOK, publicSendResponse(firstNonEmpty(req.Kind, OutboxKindText), item, publicSendWarnings(req)))
+		writeJSON(w, http.StatusOK, publicSendResponse(firstNonEmpty(req.Kind, OutboxKindText), items, publicSendWarnings(req)))
 	}
 }
 
@@ -92,14 +87,16 @@ func (s *HTTPServer) getV1OutboxItem(w http.ResponseWriter, r *http.Request) {
 }
 
 type PublicSendResponse struct {
-	OK              bool                 `json:"ok"`
-	ProtocolVersion string               `json:"protocol_version"`
-	Kind            string               `json:"kind"`
-	OutboxID        int64                `json:"outbox_id"`
-	ChatRecordID    int64                `json:"chat_record_id,omitempty"`
-	StatusURL       string               `json:"status_url"`
-	Outbox          PublicOutboxEnvelope `json:"outbox"`
-	Warnings        []string             `json:"warnings,omitempty"`
+	OK              bool                   `json:"ok"`
+	ProtocolVersion string                 `json:"protocol_version"`
+	Kind            string                 `json:"kind"`
+	OutboxID        int64                  `json:"outbox_id"`
+	OutboxIDs       []int64                `json:"outbox_ids,omitempty"`
+	ChatRecordID    int64                  `json:"chat_record_id,omitempty"`
+	StatusURL       string                 `json:"status_url"`
+	Outbox          PublicOutboxEnvelope   `json:"outbox"`
+	Outboxes        []PublicOutboxEnvelope `json:"outboxes,omitempty"`
+	Warnings        []string               `json:"warnings,omitempty"`
 }
 
 type PublicOutboxResponse struct {
@@ -246,6 +243,7 @@ func publicCapabilitiesResponse() PublicCapabilitiesResponse {
 			{Kind: MessageKindAppMsg, Subtype: "mini_program", SendKind: OutboxKindMiniProgram, Title: "小程序", InboundStatus: "structured", OutboundStatus: "source_forward_stable", Verification: "db_verified", MessageTypes: []int32{MessageTypeAppMsg}, AppMsgTypes: []int32{33, 36}, SendEndpoint: "/api/v1/messages/mini-program", RequiredFields: []string{"wx_ids", "source_chat_record_id|appmsg_title+mini_program_username+mini_program_page_path"}, Notes: []string{"源消息转发已通过真实设备验证；直接构造仍需更多真实样本。"}},
 			{Kind: MessageKindChatHistory, SendKind: OutboxKindChatHistory, Title: "聊天记录", InboundStatus: "basic", OutboundStatus: "source_forward_only", Verification: "sample_only", MessageTypes: []int32{MessageTypeAppMsg}, AppMsgTypes: []int32{19}, SendEndpoint: "/api/v1/messages/chat-history", RequiredFields: []string{"wx_ids", "recorditem_xml|source_chat_record_ids|forward_original+source_chat_record_id"}, Unsupported: []string{"arbitrary_raw_xml_send"}, Notes: []string{"仅稳定支持已有来源消息转发；嵌套 recorditem 摘要仍在收口。"}},
 			{Kind: MessageKindPayment, Title: "支付", InboundStatus: "parse_only", OutboundStatus: "unsupported", Verification: "sample_only", MessageTypes: []int32{MessageTypeTransfer, MessageTypeRedPacket, MessageTypeAppMsg}, AppMsgTypes: []int32{AppMsgTypeTransfer, AppMsgTypeRedPacket}, Unsupported: []string{"payment_outbound_unsupported", "payment_sensitive_fields_redacted"}, Notes: []string{"红包、转账只做安全识别和脱敏，不提供发送自动化。"}},
+			{Kind: MessageKindSystem, Subtype: SystemSubtypeRevoke, SendKind: OutboxKindRevoke, Title: "撤回", InboundStatus: "structured", OutboundStatus: "private_verified", Verification: "user_confirmed", MessageTypes: []int32{10000}, SendEndpoint: "/api/v1/messages/revoke", RequiredFields: []string{"wx_ids", "target_chat_record_id"}, Notes: []string{"私聊实机已验证；群聊跟随撤回仍需继续积累样本。", "只支持撤回当前账号已发送且本地 message 表仍可查到的消息。"}},
 			{Kind: MessageKindSystem, Title: "系统消息", InboundStatus: "parse_only", OutboundStatus: "non_goal", Verification: "parse_only", MessageTypes: []int32{10000}},
 			{Kind: MessageKindUnknown, Subtype: "unknown-business", Title: "未知高位业务类型", InboundStatus: "preserved", OutboundStatus: "unsupported", Verification: "sample_only", Unsupported: []string{"message_type:*"}, Notes: []string{"保留 message_type、unsupported 和 evidence，确认前不猜测业务含义。"}},
 		},
@@ -264,16 +262,27 @@ func publicCapabilitiesResponse() PublicCapabilitiesResponse {
 	}
 }
 
-func publicSendResponse(kind string, item ModuleOutboxItem, warnings []string) PublicSendResponse {
-	outbox := publicOutboxEnvelope(item)
+func publicSendResponse(kind string, items []ModuleOutboxItem, warnings []string) PublicSendResponse {
+	outboxes := make([]PublicOutboxEnvelope, 0, len(items))
+	outboxIDs := make([]int64, 0, len(items))
+	for _, item := range items {
+		outboxes = append(outboxes, publicOutboxEnvelope(item))
+		outboxIDs = append(outboxIDs, item.ID)
+	}
+	if len(items) == 0 {
+		return PublicSendResponse{OK: true, ProtocolVersion: "v1", Kind: firstNonEmpty(kind, OutboxKindText)}
+	}
+	first := items[0]
 	return PublicSendResponse{
 		OK:              true,
 		ProtocolVersion: "v1",
-		Kind:            firstNonEmpty(kind, item.Kind, OutboxKindText),
-		OutboxID:        item.ID,
-		ChatRecordID:    item.ID,
-		StatusURL:       publicOutboxStatusURL(item.ID),
-		Outbox:          outbox,
+		Kind:            firstNonEmpty(kind, first.Kind, OutboxKindText),
+		OutboxID:        first.ID,
+		OutboxIDs:       outboxIDs,
+		ChatRecordID:    first.ChatRecordID,
+		StatusURL:       publicOutboxStatusURL(first.ID),
+		Outbox:          outboxes[0],
+		Outboxes:        outboxes,
 		Warnings:        warnings,
 	}
 }
@@ -308,7 +317,7 @@ func publicSendWarnings(req SendActionRequest) []string {
 	if len(req.WxIDs) <= 1 {
 		return nil
 	}
-	return []string{"multiple_targets_first_outbox_returned"}
+	return []string{"multiple_targets_outboxes_returned", "singular_outbox_fields_reference_first_target"}
 }
 
 type PublicMessagesResponse struct {
@@ -342,6 +351,7 @@ type PublicMessageEnvelope struct {
 	Media           []PublicMessageMedia    `json:"media,omitempty"`
 	AppMsg          *PublicAppMsgEnvelope   `json:"appmsg,omitempty"`
 	Location        *PublicLocationEnvelope `json:"location,omitempty"`
+	System          *PublicSystemEnvelope   `json:"system,omitempty"`
 	Unsupported     []string                `json:"unsupported,omitempty"`
 	Evidence        []string                `json:"evidence,omitempty"`
 	CreateTime      int64                   `json:"create_time,omitempty"`
@@ -378,6 +388,14 @@ type PublicLocationEnvelope struct {
 	PoiID           string   `json:"poi_id,omitempty"`
 	FromPoiList     bool     `json:"from_poi_list,omitempty"`
 	PoiCategoryTips string   `json:"poi_category_tips,omitempty"`
+}
+
+type PublicSystemEnvelope struct {
+	Subtype     string `json:"subtype,omitempty"`
+	Session     string `json:"session,omitempty"`
+	MsgID       string `json:"msg_id,omitempty"`
+	NewMsgID    string `json:"new_msg_id,omitempty"`
+	Replacement string `json:"replacement,omitempty"`
 }
 
 func (s *HTTPServer) getV1Messages(w http.ResponseWriter, r *http.Request) {
@@ -489,6 +507,7 @@ func publicStoredMessageEnvelope(item StoredEventView) PublicMessageEnvelope {
 		chatID = firstNonEmpty(chatID, event.ChatID())
 		chatKind = firstNonEmpty(chatKind, string(event.Kind()))
 	}
+	kind := publicStoredMessageKind(item)
 	envelope := PublicMessageEnvelope{
 		ID:              publicStoredEnvelopeID(item),
 		EventID:         item.EventID,
@@ -496,7 +515,7 @@ func publicStoredMessageEnvelope(item StoredEventView) PublicMessageEnvelope {
 		Device:          item.Device,
 		OwnerWxID:       item.OwnerWxID,
 		Direction:       item.Direction,
-		Kind:            publicStoredMessageKind(item),
+		Kind:            kind,
 		Subtype:         publicStoredMessageSubtype(item),
 		MessageType:     item.MessageType,
 		AppMsgType:      item.AppMsgType,
@@ -514,7 +533,11 @@ func publicStoredMessageEnvelope(item StoredEventView) PublicMessageEnvelope {
 		ChatDisplayName: item.ChatDisplayName,
 	}
 	envelope.Media = publicMessageMedia(item.MediaKind, item.MediaMime, item.MediaName, item.MediaURL, item.MediaSize)
-	envelope.AppMsg = publicAppMsgEnvelope(item.AppMsgType, item.AppMsgSubtype, item.AppMsgTitle, item.AppMsgDescription, item.AppMsgURL, item.AppMsgFileName, item.AppMsgAppName)
+	if kind == MessageKindSystem {
+		envelope.System = publicSystemEnvelope(item.AppMsgSubtype, item.AppMsgURL, item.AppMsgFileName, item.AppMsgAppName, item.AppMsgTitle)
+	} else {
+		envelope.AppMsg = publicAppMsgEnvelope(item.AppMsgType, item.AppMsgSubtype, item.AppMsgTitle, item.AppMsgDescription, item.AppMsgURL, item.AppMsgFileName, item.AppMsgAppName)
+	}
 	envelope.Location = publicLocationEnvelope(item.LocationLatitude, item.LocationLongitude, item.LocationScale, item.LocationLabel, item.LocationPoiName, item.LocationInfoURL, item.LocationPoiID, item.LocationFromPoiList, item.LocationPoiTips)
 	return envelope
 }
@@ -555,6 +578,7 @@ func publicEventMessageEnvelope(event MessageEvent) PublicMessageEnvelope {
 	event.MediaBase64 = ""
 	event.RawXML = ""
 	event = event.Normalize()
+	kind := firstNonEmpty(event.MessageKind, messageKindForType(event.MessageType))
 	envelope := PublicMessageEnvelope{
 		ID:           publicEventEnvelopeID(event),
 		EventID:      event.EventID,
@@ -562,7 +586,7 @@ func publicEventMessageEnvelope(event MessageEvent) PublicMessageEnvelope {
 		Device:       event.Device,
 		OwnerWxID:    event.OwnerWxID,
 		Direction:    string(event.Direction),
-		Kind:         firstNonEmpty(event.MessageKind, messageKindForType(event.MessageType)),
+		Kind:         kind,
 		Subtype:      event.AppMsgSubtype,
 		MessageType:  event.MessageType,
 		AppMsgType:   event.AppMsgType,
@@ -578,7 +602,11 @@ func publicEventMessageEnvelope(event MessageEvent) PublicMessageEnvelope {
 		CreateTime:   event.Timestamp(),
 	}
 	envelope.Media = publicMessageMedia(event.MediaKind, event.MediaMime, event.MediaName, event.MediaURL, event.MediaSize)
-	envelope.AppMsg = publicAppMsgEnvelope(event.AppMsgType, event.AppMsgSubtype, event.AppMsgTitle, event.AppMsgDescription, event.AppMsgURL, event.AppMsgFileName, event.AppMsgAppName)
+	if kind == MessageKindSystem {
+		envelope.System = publicSystemEnvelope(event.AppMsgSubtype, event.AppMsgURL, event.AppMsgFileName, event.AppMsgAppName, event.AppMsgTitle)
+	} else {
+		envelope.AppMsg = publicAppMsgEnvelope(event.AppMsgType, event.AppMsgSubtype, event.AppMsgTitle, event.AppMsgDescription, event.AppMsgURL, event.AppMsgFileName, event.AppMsgAppName)
+	}
 	envelope.Location = publicLocationEnvelope(event.LocationLatitude, event.LocationLongitude, event.LocationScale, event.LocationLabel, event.LocationPoiName, event.LocationInfoURL, event.LocationPoiID, event.LocationFromPoiList, event.LocationPoiTips)
 	return envelope
 }
@@ -632,6 +660,23 @@ func publicAppMsgEnvelope(appMsgType int32, subtype string, title string, descri
 		URL:         strings.TrimSpace(url),
 		FileName:    strings.TrimSpace(fileName),
 		AppName:     strings.TrimSpace(appName),
+	}
+}
+
+func publicSystemEnvelope(subtype string, session string, msgID string, newMsgID string, replacement string) *PublicSystemEnvelope {
+	if strings.TrimSpace(subtype) == "" &&
+		strings.TrimSpace(session) == "" &&
+		strings.TrimSpace(msgID) == "" &&
+		strings.TrimSpace(newMsgID) == "" &&
+		strings.TrimSpace(replacement) == "" {
+		return nil
+	}
+	return &PublicSystemEnvelope{
+		Subtype:     strings.TrimSpace(subtype),
+		Session:     strings.TrimSpace(session),
+		MsgID:       strings.TrimSpace(msgID),
+		NewMsgID:    strings.TrimSpace(newMsgID),
+		Replacement: strings.TrimSpace(replacement),
 	}
 }
 

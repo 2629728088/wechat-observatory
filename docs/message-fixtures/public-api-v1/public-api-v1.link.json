@@ -76,7 +76,6 @@
   },
   "protocol_version": "v1",
   "send_response": {
-    "chat_record_id": 1001,
     "kind": "appmsg",
     "ok": true,
     "outbox": {

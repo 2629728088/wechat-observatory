@@ -659,6 +659,7 @@ const openAPIDocsHTML = `<!doctype html>
               <tr><td>链接</td><td><code>/api/v1/messages/link</code></td><td><span class="status stable">稳定</span></td><td><code>source_chat_record_id</code> 或标题 + URL</td><td>可原样转发，也可直接构造。</td></tr>
               <tr><td>小程序</td><td><code>/api/v1/messages/mini-program</code></td><td><span class="status partial">源转发稳定</span></td><td><code>source_chat_record_id</code> 或 username + page path</td><td>直接构造还需要真实样本。</td></tr>
               <tr><td>聊天记录</td><td><code>/api/v1/messages/chat-history</code></td><td><span class="status partial">转发限定</span></td><td><code>source_chat_record_ids</code>、<code>recorditem_xml</code></td><td>不开放任意 raw XML 自动化。</td></tr>
+              <tr><td>撤回</td><td><code>/api/v1/messages/revoke</code></td><td><span class="status partial">私聊已验证</span></td><td><code>target_chat_record_id</code></td><td>群聊跟随撤回仍需继续积累样本。</td></tr>
               <tr><td>支付/红包/转账</td><td>无</td><td><span class="status readonly">只读识别</span></td><td><code>kind=payment</code>、<code>subtype</code></td><td>出站自动化明确不支持。</td></tr>
               <tr><td>未知业务类型</td><td>无</td><td><span class="status stop">保留证据</span></td><td><code>message_type</code>、<code>unsupported</code></td><td>确认前不猜测业务含义。</td></tr>
             </tbody>
@@ -949,6 +950,20 @@ const openAPIJSONDocument = `{
         "description": "可传 recorditem_xml 或 source_chat_record_ids 构造聊天记录；当前以已有来源消息转发为主，不提供任意 raw XML 自动化。",
         "security": [{ "BridgeAPIKeyHeader": [] }, { "BridgeAPIKeyQuery": [] }, { "BridgePasswordHeader": [] }, { "BridgePasswordQuery": [] }],
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatHistoryMessageRequest" } } } },
+        "responses": {
+          "200": { "$ref": "#/components/responses/SendQueuedResponse" },
+          "400": { "$ref": "#/components/responses/ErrorResponse" },
+          "401": { "$ref": "#/components/responses/ErrorResponse" }
+        }
+      }
+    },
+    "/api/v1/messages/revoke": {
+      "post": {
+        "tags": ["外部发送"],
+        "summary": "撤回已发送消息",
+        "description": "撤回当前账号已发送且本地 message 表仍可查到的消息。target_chat_record_id 应来自发送 ACK 返回的 chat_record_id。",
+        "security": [{ "BridgeAPIKeyHeader": [] }, { "BridgeAPIKeyQuery": [] }, { "BridgePasswordHeader": [] }, { "BridgePasswordQuery": [] }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RevokeMessageRequest" } } } },
         "responses": {
           "200": { "$ref": "#/components/responses/SendQueuedResponse" },
           "400": { "$ref": "#/components/responses/ErrorResponse" },
@@ -1479,12 +1494,11 @@ const openAPIJSONDocument = `{
                 "summary": "文本消息已入队",
                 "value": {
                   "ok": true,
-                  "protocol_version": "v1",
-                  "kind": "text",
-                  "outbox_id": 123,
-                  "chat_record_id": 123,
-                  "status_url": "/api/v1/outbox/123",
-                  "outbox": {
+	                  "protocol_version": "v1",
+	                  "kind": "text",
+	                  "outbox_id": 123,
+	                  "status_url": "/api/v1/outbox/123",
+	                  "outbox": {
                     "id": 123,
                     "device": "phone-a",
                     "target_wxid": "<target_wxid_or_room_id>",
@@ -1499,12 +1513,11 @@ const openAPIJSONDocument = `{
                 "summary": "图片消息已入队",
                 "value": {
                   "ok": true,
-                  "protocol_version": "v1",
-                  "kind": "image",
-                  "outbox_id": 124,
-                  "chat_record_id": 124,
-                  "status_url": "/api/v1/outbox/124",
-                  "outbox": {
+	                  "protocol_version": "v1",
+	                  "kind": "image",
+	                  "outbox_id": 124,
+	                  "status_url": "/api/v1/outbox/124",
+	                  "outbox": {
                     "id": 124,
                     "device": "phone-a",
                     "target_wxid": "<target_wxid_or_room_id>",
@@ -1698,10 +1711,12 @@ const openAPIJSONDocument = `{
           "ok": { "type": "boolean", "example": true },
           "protocol_version": { "type": "string", "example": "v1" },
           "kind": { "type": "string" },
-          "outbox_id": { "type": "integer", "format": "int64" },
-          "chat_record_id": { "type": "integer", "format": "int64", "description": "兼容字段，当前等同首个 outbox_id。" },
+          "outbox_id": { "type": "integer", "format": "int64", "description": "兼容字段：多目标发送时指向第一个 outbox。" },
+          "outbox_ids": { "type": "array", "items": { "type": "integer", "format": "int64" }, "description": "本次请求创建的全部 outbox ID，顺序与 wx_ids 一致。" },
+          "chat_record_id": { "type": "integer", "format": "int64", "description": "真实微信本地消息 ID。入队响应通常为空；手机模块 ACK 后请以 outbox.chat_record_id 为准。" },
           "status_url": { "type": "string", "example": "/api/v1/outbox/123" },
-          "outbox": { "$ref": "#/components/schemas/PublicOutboxEnvelope" },
+          "outbox": { "$ref": "#/components/schemas/PublicOutboxEnvelope", "description": "兼容字段：多目标发送时指向第一个 outbox。" },
+          "outboxes": { "type": "array", "items": { "$ref": "#/components/schemas/PublicOutboxEnvelope" }, "description": "本次请求创建的全部 outbox，顺序与 wx_ids 一致。" },
           "warnings": { "type": "array", "items": { "type": "string" } }
         }
       },
@@ -1894,6 +1909,20 @@ const openAPIJSONDocument = `{
           }
         ]
       },
+      "RevokeMessageRequest": {
+        "allOf": [
+          { "$ref": "#/components/schemas/SendTarget" },
+          {
+            "type": "object",
+            "required": ["target_chat_record_id"],
+            "properties": {
+              "target_chat_record_id": { "type": "integer", "format": "int64", "description": "要撤回的目标消息本地 chat_record_id，来自发送 ACK。" },
+              "target_msg_svr_id": { "type": "integer", "format": "int64", "description": "可选的服务端消息 ID，用于手机端查找兜底。" },
+              "revoke_ticket": { "type": "string", "description": "微信内部撤回 ticket；通常不需要外部填写。" }
+            }
+          }
+        ]
+      },
       "SendTextRequest": {
         "type": "object",
         "required": ["device", "owner_wxid", "wx_ids", "text"],
@@ -1921,7 +1950,7 @@ const openAPIJSONDocument = `{
           },
           "kind": {
             "type": "string",
-            "enum": ["text", "image", "video", "voice", "file", "emoji", "location", "quote", "link", "mini_program", "chat_history"]
+            "enum": ["text", "image", "video", "voice", "file", "emoji", "location", "quote", "link", "mini_program", "chat_history", "revoke"]
           },
           "text": { "type": "string" },
           "media_kind": { "type": "string" },
@@ -1956,6 +1985,9 @@ const openAPIJSONDocument = `{
             "type": "array",
             "items": { "type": "integer", "format": "int64" }
           },
+          "target_chat_record_id": { "type": "integer", "format": "int64" },
+          "target_msg_svr_id": { "type": "integer", "format": "int64" },
+          "revoke_ticket": { "type": "string" },
           "location_latitude": { "type": "number", "format": "double" },
           "location_longitude": { "type": "number", "format": "double" },
           "location_scale": { "type": "integer" },

@@ -295,7 +295,7 @@ func scanStoredEventViews(rows *sql.Rows) ([]bridge.StoredEventView, error) {
 
 func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusView, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT ak.device, d.wxid, COALESCE(d.nickname, ak.nickname, ak.device), ak.enabled, d.updated_at,
+		SELECT ak.device, d.wxid, COALESCE(NULLIF(d.nickname, ''), ak.nickname, ak.device), ak.enabled, d.updated_at,
 			rt.last_register_at,
 			rt.last_poll_at,
 			rt.last_ack_at,
@@ -306,7 +306,7 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 			rt.last_error,
 			rt.updated_at,
 			rt.api_key,
-			ak.code,
+			ak.active_code,
 			COALESCE(obs.pending_count, 0),
 			COALESCE(obs.leased_count, 0),
 			COALESCE(obs.sent_count, 0),
@@ -318,7 +318,17 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 			ev.last_event_at,
 			ev.last_inbound_at,
 			ev.last_outbound_ack_at
-		FROM bridge_api_keys ak
+		FROM (
+			SELECT raw.device,
+				MAX(CASE WHEN raw.enabled THEN 1 ELSE 0 END) AS enabled,
+				NULLIF(MAX(CASE WHEN raw.nickname IS NOT NULL AND raw.nickname <> '' THEN raw.nickname ELSE '' END), '') AS nickname,
+				NULLIF(MAX(CASE WHEN raw.enabled AND raw.code = rt.api_key THEN raw.code ELSE '' END), '') AS active_code
+			FROM bridge_api_keys raw
+			LEFT JOIN bridge_module_runtime rt
+				ON rt.device = raw.device
+			WHERE raw.device IS NOT NULL AND raw.device <> ''
+			GROUP BY raw.device
+		) ak
 		LEFT JOIN bridge_devices d
 			ON d.name = ak.device
 		LEFT JOIN bridge_module_runtime rt
@@ -344,7 +354,6 @@ func (s *Store) ListModuleStatuses(ctx context.Context) ([]bridge.ModuleStatusVi
 			FROM bridge_message_events
 			GROUP BY device
 		) ev ON ev.device = ak.device
-		WHERE ak.device IS NOT NULL AND ak.device <> ''
 		ORDER BY ak.device ASC`, bridge.RawProviderModuleAck)
 	if err != nil {
 		return nil, err

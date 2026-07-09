@@ -20,7 +20,8 @@ import java.util.Map;
 public final class SettingsActivity extends Activity {
     private static final String DEFAULT_BRIDGE_URL = "http://192.168.1.10:8088";
     private static final String DEFAULT_POLL_INTERVAL_MS = "1000";
-    private static final String DEFAULT_POLL_LIMIT = "1";
+    private static final String DEFAULT_POLL_LIMIT = "20";
+    private static final String DEFAULT_OUTBOX_PARALLELISM = "4";
     private static final String DEFAULT_CONTACT_SYNC_INTERVAL_MS = "600000";
     private static final String DEFAULT_CONTACT_SYNC_LIMIT = "1000";
     private static final String DEFAULT_CONTACT_INCLUDE_CHATROOMS = "1";
@@ -35,6 +36,7 @@ public final class SettingsActivity extends Activity {
         DEFAULTS.put("api_key", "");
         DEFAULTS.put("poll_interval_ms", DEFAULT_POLL_INTERVAL_MS);
         DEFAULTS.put("poll_limit", DEFAULT_POLL_LIMIT);
+        DEFAULTS.put("outbox_parallelism", DEFAULT_OUTBOX_PARALLELISM);
         DEFAULTS.put("contact_sync_interval_ms", DEFAULT_CONTACT_SYNC_INTERVAL_MS);
         DEFAULTS.put("contact_sync_limit", DEFAULT_CONTACT_SYNC_LIMIT);
         DEFAULTS.put("contact_include_chatrooms", DEFAULT_CONTACT_INCLUDE_CHATROOMS);
@@ -79,6 +81,7 @@ public final class SettingsActivity extends Activity {
         addField(root, "api_key", R.string.label_api_key, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         addField(root, "poll_interval_ms", R.string.label_poll_interval, InputType.TYPE_CLASS_NUMBER);
         addField(root, "poll_limit", R.string.label_poll_limit, InputType.TYPE_CLASS_NUMBER);
+        addField(root, "outbox_parallelism", R.string.label_outbox_parallelism, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_sync_interval_ms", R.string.label_contact_sync_interval, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_sync_limit", R.string.label_contact_sync_limit, InputType.TYPE_CLASS_NUMBER);
         addField(root, "contact_include_chatrooms", R.string.label_contact_include_chatrooms, InputType.TYPE_CLASS_NUMBER);

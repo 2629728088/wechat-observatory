@@ -15,8 +15,6 @@ import org.json.JSONObject;
 import java.io.BufferedReader;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileOutputStream;
-import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -32,10 +30,17 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.FutureTask;
+import java.util.concurrent.Future;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
@@ -48,6 +53,7 @@ import java.util.Set;
 import cc.wechat.observatory.config.BridgeConfig;
 import cc.wechat.observatory.gateway.WebSocketFrame;
 import cc.wechat.observatory.model.MessagePayload;
+import cc.wechat.observatory.outbox.OutboxMediaFilePreparer;
 import cc.wechat.observatory.util.BridgeLogger;
 import cc.wechat.observatory.wechat.SendResult;
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -73,10 +79,13 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static final int APPMSG_TYPE_MINI_PROGRAM_LEGACY = 36;
     private static final int APPMSG_TYPE_QUOTE = 57;
     private static final int MAX_CHAT_HISTORY_SOURCE_ITEMS = 50;
-    private static final long OUTBOX_MEDIA_DOWNLOAD_LIMIT_BYTES = 50L * 1024L * 1024L;
+    private static final int BRIDGE_CONNECT_TIMEOUT_MS = 10000;
+    private static final int BRIDGE_READ_TIMEOUT_MS = 30000;
+    private static final Object WECHAT_SEND_LOCK = new Object();
     private static final AtomicBoolean WORKER_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean OUTBOX_WORKER_STARTED = new AtomicBoolean(false);
     private static final AtomicBoolean EXTERNAL_STORAGE_FALLBACK_HOOKED = new AtomicBoolean(false);
+    private static final AtomicBoolean REVOKE_EVENT_HOOKED = new AtomicBoolean(false);
     private static final ExecutorService POST_EXECUTOR = Executors.newSingleThreadExecutor(new ThreadFactory() {
         @Override
         public Thread newThread(Runnable runnable) {
@@ -97,11 +106,37 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile int MESSAGE_POLL_CONSECUTIVE_FAILS = 0;
     private static volatile long MESSAGE_POLL_BACKOFF_UNTIL = 0L;
     private static volatile long LAST_MESSAGE_POLL_FAIL_LOG_AT = 0L;
-    private static final long[] MEDIA_RETRY_DELAYS_MS = new long[]{3000L, 10000L, 30000L, 120000L};
-    private static final Set<Long> MEDIA_RETRY_SCHEDULED_IDS = new HashSet<>();
-    private static final Set<Long> MEDIA_UPLOAD_REPORTED_IDS = new HashSet<>();
-    private static final Set<String> EMOJI_INFO_DIAGNOSTIC_REPORTED_MD5 = new HashSet<>();
-    private static volatile long LAST_MEDIA_RETRY_FAIL_LOG_AT = 0L;
+    private static final HookMediaAttachmentController MEDIA_ATTACHMENT_CONTROLLER =
+            HookMediaServices.attachmentController(
+                    HookEntry::wechatAppRoot,
+                    HookEntry::wechatRuntimeClassLoader,
+                    HookEntry::callOnMainThread,
+                    HookEntry::sleepQuietly,
+                    bytes -> Base64.encodeToString(bytes, Base64.NO_WRAP),
+                    HookEntry::log,
+                    HookEntry::loadEmojiInfoByMd5,
+                    HookEntry::logEmojiInfoDiagnostic);
+    private static final HookMediaRetryScheduler MEDIA_RETRY_SCHEDULER =
+            HookMediaServices.mediaRetryScheduler(mediaRetryEnvironment(), MEDIA_ATTACHMENT_CONTROLLER);
+    private static final HookWechatVoiceFilePreparer.Reflection WECHAT_VOICE_FILE_REFLECTION =
+            new HookWechatVoiceFilePreparer.Reflection() {
+                @Override
+                public Class<?> findClass(ClassLoader classLoader, String name) throws ClassNotFoundException {
+                    return HookEntry.findClass(classLoader, name);
+                }
+
+                @Override
+                public Method findMethod(Class<?> cls, String name, Class<?>... parameterTypes) throws NoSuchMethodException {
+                    return HookEntry.findMethod(cls, name, parameterTypes);
+                }
+
+                @Override
+                public Field findField(Class<?> cls, String name) throws NoSuchFieldException {
+                    return HookEntry.findField(cls, name);
+                }
+            };
+    private static final Set<Long> REVOKE_UPDATE_REPORTED_IDS = new HashSet<>();
+    private static final Set<Long> REVOKE_CONFIRMED_IDS = new HashSet<>();
     private static volatile long LAST_WEBSOCKET_FAIL_LOG_AT = 0L;
     private static volatile String CURRENT_WXID = "";
     private static volatile String CURRENT_NICKNAME = "";
@@ -112,6 +147,13 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static volatile long LAST_USER_SKIP_LOG_AT = 0L;
     private static volatile Context APP_CONTEXT;
     private static volatile ClassLoader WECHAT_CLASS_LOADER;
+    private static final HookEmojiInfoDiagnosticReporter EMOJI_INFO_DIAGNOSTIC_REPORTER =
+            new HookEmojiInfoDiagnosticReporter(
+                    () -> runtimeClassLoader(WECHAT_CLASS_LOADER == null
+                            ? HookEntry.class.getClassLoader()
+                            : WECHAT_CLASS_LOADER),
+                    HookEntry::loadEmojiInfoByMd5,
+                    HookEntry::log);
 
     private static final class QuoteSource {
         long msgId;
@@ -134,12 +176,6 @@ public final class HookEntry implements IXposedHookLoadPackage {
         long createTime;
         int type;
         String msgSource;
-    }
-
-    private static final class RecentMediaCandidate {
-        File file;
-        long distanceMs = Long.MAX_VALUE;
-        long modifiedMs = 0L;
     }
 
     @Override
@@ -172,6 +208,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                         }
                     });
             hookDatabaseCaptureMethods(sqliteDatabase);
+            hookRevokeEventPublish(lpparam.classLoader);
             log("hooked WeChat WCDB access methods");
             if (mainProcess) {
                 hookApplicationAttach(lpparam.classLoader);
@@ -300,6 +337,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
             try {
                 method.setAccessible(true);
+                final String methodName = name;
                 XposedBridge.hookMethod(method, new XC_MethodHook() {
                     @Override
                     protected void beforeHookedMethod(MethodHookParam param) {
@@ -309,6 +347,9 @@ public final class HookEntry implements IXposedHookLoadPackage {
                     @Override
                     protected void afterHookedMethod(MethodHookParam param) {
                         captureDatabaseFromArgs(param.thisObject, param.args);
+                        if (isMessageUpdateMethod(methodName)) {
+                            handleMessageUpdate(param);
+                        }
                     }
                 });
             } catch (Throwable t) {
@@ -329,6 +370,206 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 || "update".equals(name)
                 || "updateWithOnConflict".equals(name)
                 || "delete".equals(name);
+    }
+
+    private static boolean isMessageUpdateMethod(String name) {
+        return "update".equals(name) || "updateWithOnConflict".equals(name);
+    }
+
+    private static void hookRevokeEventPublish(final ClassLoader classLoader) {
+        if (!REVOKE_EVENT_HOOKED.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            Class<?> eventClass = findClass(classLoader, "com.tencent.mm.sdk.event.IEvent");
+            Class<?> eventPoolClass = findClass(classLoader, "com.tencent.mm.sdk.event.d");
+            Method publish = findMethod(eventPoolClass, "d", eventClass, boolean.class);
+            XposedBridge.hookMethod(publish, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (param.args != null && param.args.length > 0) {
+                        handleRevokeEventAsync(param.args[0]);
+                    }
+                }
+            });
+            log("hooked WeChat revoke event publisher");
+        } catch (Throwable t) {
+            log("hook revoke event publisher failed: " + shortError(t));
+        }
+    }
+
+    private static void handleRevokeEventAsync(final Object event) {
+        if (!isRevokeMsgEvent(event)) {
+            return;
+        }
+        POST_EXECUTOR.execute(new Runnable() {
+            @Override
+            public void run() {
+                handleRevokeEvent(event);
+            }
+        });
+    }
+
+    private static boolean isRevokeMsgEvent(Object event) {
+        return event != null
+                && "com.tencent.mm.autogen.events.RevokeMsgEvent".equals(event.getClass().getName());
+    }
+
+    private static void handleRevokeEvent(Object event) {
+        try {
+            BridgeConfig config = BridgeConfig.load(bridgeContext());
+            if (!isTargetAndroidUser(config)) {
+                return;
+            }
+            if (!config.enabled || isBlank(config.baseUrl) || isBlank(config.apiKey)) {
+                return;
+            }
+            if (!bindRuntimeIdentity(config) || !ensureRegistered(config)) {
+                return;
+            }
+
+            MessagePayload payload = buildRevokeEventPayload(config, event);
+            if (payload == null) {
+                log("revoke event ignored because message row could not be resolved");
+                return;
+            }
+            if (!rememberRevokeUpdate(payload)) {
+                return;
+            }
+            rememberRevokeConfirmed(payload.chatRecordId);
+            post(config, payload);
+            log("reported revoke event msgId=" + payload.chatRecordId + " chat=" + redactedId(payload.chatId));
+        } catch (Throwable t) {
+            log("handle revoke event failed: " + shortError(t));
+        }
+    }
+
+    private static MessagePayload buildRevokeEventPayload(BridgeConfig config, Object event) throws Exception {
+        Object data = revokeEventData(event);
+        if (data == null) {
+            return null;
+        }
+        long eventMsgId = optionalLongField(data, "a", "msgId", "eventMsgId");
+        long eventMsgSvrId = optionalLongField(data, "e", "msgSvrId", "newMsgId", "eventMsgSrvId");
+        String replaceMsg = firstNonBlank(
+                optionalStringField(data, "b", "replaceMsg", "replacemsg"),
+                optionalStringField(data, "f"));
+
+        Object message = optionalObjectField(data, "c", "d", "message", "msg");
+        long objectMsgId = firstPositiveLong(
+                optionalLongMethod(message, "getMsgId"),
+                optionalLongField(message, "field_msgId", "msgId"));
+        long objectMsgSvrId = firstPositiveLong(
+                optionalLongMethod(message, "getMsgSvrId"),
+                optionalLongField(message, "field_msgSvrId", "msgSvrId"));
+        String objectTalker = firstNonBlank(
+                optionalStringMethod(message, "Q0"),
+                optionalStringMethod(message, "getTalker"),
+                optionalStringField(message, "field_talker", "talker"));
+
+        Object db = LAST_DATABASE;
+        if (db == null) {
+            db = findContactDatabaseOnMainThread(config);
+        }
+
+        MessagePayload source = null;
+        long sourceMsgId = firstPositiveLong(eventMsgId, objectMsgId);
+        if (db != null && sourceMsgId > 0L) {
+            source = loadMessagePayloadById(config, db, sourceMsgId);
+        }
+        String session = firstNonBlank(
+                source == null ? "" : source.chatId,
+                objectTalker,
+                optionalStringField(data, "session", "talker"));
+        if (isBlank(session)) {
+            return null;
+        }
+
+        long recordId = firstPositiveLong(
+                source == null ? 0L : source.chatRecordId,
+                sourceMsgId,
+                objectMsgId,
+                eventMsgSvrId,
+                objectMsgSvrId);
+        if (recordId <= 0L) {
+            return null;
+        }
+        long serverId = firstPositiveLong(eventMsgSvrId, objectMsgSvrId);
+        String rawXml = buildRevokeRawXml(session, recordId, serverId, replaceMsg);
+        return buildSystemRevokePayload(config, source, session, recordId, rawXml, replaceMsg);
+    }
+
+    private static Object revokeEventData(Object event) {
+        try {
+            return findFieldAny(event.getClass(), "g").get(event);
+        } catch (Throwable ignored) {
+            Field[] fields = event.getClass().getDeclaredFields();
+            for (Field field : fields) {
+                if (Modifier.isStatic(field.getModifiers())) {
+                    continue;
+                }
+                try {
+                    field.setAccessible(true);
+                    Object value = field.get(event);
+                    if (value != null) {
+                        return value;
+                    }
+                } catch (Throwable ignoredField) {
+                    // Try the next candidate.
+                }
+            }
+        }
+        return null;
+    }
+
+    private static MessagePayload buildSystemRevokePayload(
+            BridgeConfig config,
+            MessagePayload source,
+            String session,
+            long recordId,
+            String rawXml,
+            String replaceMsg) {
+        MessagePayload payload = new MessagePayload();
+        payload.id = String.valueOf(recordId) + ":revoke";
+        payload.eventId = recordId;
+        payload.chatRecordId = recordId;
+        payload.apiKey = config.apiKey;
+        payload.device = config.device;
+        payload.chatId = session;
+        payload.chatKind = isChatroomTalker(session) ? "room" : "direct";
+        payload.roomId = isChatroomTalker(session) ? session : "";
+        payload.text = firstNonBlank(replaceMsg, "[系统消息]");
+        payload.messageType = 10000;
+        payload.rawXml = rawXml;
+        payload.createTime = System.currentTimeMillis() / 1000L;
+
+        if (source != null) {
+            payload.direction = source.direction;
+            payload.from = source.from;
+            payload.to = source.to;
+            payload.sender = source.sender;
+            return payload;
+        }
+
+        payload.direction = "recv";
+        payload.from = session;
+        payload.to = config.selfWxid;
+        payload.sender = "";
+        return payload;
+    }
+
+    private static String buildRevokeRawXml(String session, long msgId, long msgSvrId, String replaceMsg) {
+        String message = firstNonBlank(replaceMsg, "撤回了一条消息");
+        String id = String.valueOf(msgId);
+        String serverId = msgSvrId > 0L ? String.valueOf(msgSvrId) : id;
+        return "<sysmsg type=\"revokemsg\"><revokemsg>"
+                + "<session>" + xmlEscape(session) + "</session>"
+                + "<oldmsgid>" + xmlEscape(id) + "</oldmsgid>"
+                + "<msgid>" + xmlEscape(id) + "</msgid>"
+                + "<newmsgid>" + xmlEscape(serverId) + "</newmsgid>"
+                + "<msgsvrid>" + xmlEscape(serverId) + "</msgsvrid>"
+                + "<replacemsg><![CDATA[" + cdataSafe(message) + "]]></replacemsg>"
+                + "</revokemsg></sysmsg>";
     }
 
     private static void captureDatabaseFromArgs(Object db, Object[] args) {
@@ -454,6 +695,58 @@ public final class HookEntry implements IXposedHookLoadPackage {
         thread.start();
     }
 
+    private static void handleMessageUpdate(XC_MethodHook.MethodHookParam param) {
+        try {
+            if (!isTargetAndroidUser(BridgeConfig.load(bridgeContext()))) {
+                return;
+            }
+            String table = stringArg(param.args, 0);
+            if (param.thisObject != null && "message".equals(table)) {
+                LAST_DATABASE = param.thisObject;
+            }
+            if (!"message".equals(table) || affectedRows(param.getResult()) <= 0) {
+                return;
+            }
+            ContentValues values = contentValuesArg(param.args);
+            if (values == null) {
+                return;
+            }
+            String content = values.getAsString("content");
+            if (!containsRevokePayload(content)) {
+                return;
+            }
+
+            BridgeConfig config = BridgeConfig.load(bridgeContext());
+            if (!isTargetAndroidUser(config)) {
+                return;
+            }
+            if (!config.enabled || isBlank(config.baseUrl) || isBlank(config.apiKey)) {
+                return;
+            }
+            if (!bindRuntimeIdentity(config)) {
+                return;
+            }
+            if (!ensureRegistered(config)) {
+                return;
+            }
+
+            MessagePayload payload = loadRevokeUpdatePayload(config, param.thisObject, values, param.args);
+            if (payload == null || !containsRevokePayload(firstNonBlank(payload.rawXml, content))) {
+                log("revoke update ignored because message row could not be resolved");
+                return;
+            }
+            markRevokeUpdatePayload(payload);
+            if (!rememberRevokeUpdate(payload)) {
+                return;
+            }
+            rememberRevokeConfirmed(payload.chatRecordId);
+            postAsync(config, payload, "handle update revoke");
+            log("reported revoke update msgId=" + payload.chatRecordId + " chat=" + redactedId(payload.chatId));
+        } catch (Throwable t) {
+            log("handle update revoke failed: " + t);
+        }
+    }
+
     private static void handleInsert(XC_MethodHook.MethodHookParam param) {
         try {
             if (!isTargetAndroidUser(BridgeConfig.load(bridgeContext()))) {
@@ -499,10 +792,25 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 return;
             }
 
-            String mediaHint = resolveMediaHint(param.thisObject, messageType, msgId, msgSvrId, imgPath);
-            MessagePayload payload = buildMessagePayload(config, talker, content, isSend, msgId, createTime, messageType, mediaHint);
+            String mediaHint = MEDIA_ATTACHMENT_CONTROLLER.resolveMediaHint(
+                    param.thisObject,
+                    messageType,
+                    msgId,
+                    msgSvrId,
+                    imgPath);
+            MessagePayload payload = buildMessagePayload(config, talker, content, isSend, msgId, msgSvrId, createTime, messageType, mediaHint);
             postAsync(config, payload, "handle insert");
-            scheduleMediaRetryIfNeeded(config, talker, content, isSend, msgId, msgSvrId, createTime, messageType, mediaHint, payload);
+            MEDIA_RETRY_SCHEDULER.scheduleIfNeeded(
+                    config != null && config.mediaUploadEnabled,
+                    msgId,
+                    msgSvrId,
+                    talker,
+                    content,
+                    isSend,
+                    createTime,
+                    messageType,
+                    mediaHint,
+                    payload);
             if (msgId != null && msgId > LAST_MESSAGE_ID) {
                 LAST_MESSAGE_ID = msgId;
                 MESSAGE_WATERMARK_READY = true;
@@ -525,12 +833,27 @@ public final class HookEntry implements IXposedHookLoadPackage {
             public void run() {
                 try {
                     post(config, payload);
-                    rememberMediaUpload(payload);
+                    MEDIA_RETRY_SCHEDULER.rememberUploaded(payload);
                 } catch (Throwable t) {
                     log(context + " async upload failed: " + shortError(t));
                 }
             }
         });
+    }
+
+    private static HookMediaRetryEnvironment mediaRetryEnvironment() {
+        return HookMediaServices.retryEnvironment(
+                () -> BridgeConfig.load(bridgeContext()),
+                () -> LAST_DATABASE,
+                HookEntry::isTargetAndroidUser,
+                HookEntry::bindRuntimeIdentity,
+                HookEntry::ensureRegistered,
+                HookEntry::sleepQuietly,
+                HookEntry::log,
+                new HookMediaRetryMessageBridge(
+                        MEDIA_ATTACHMENT_CONTROLLER::resolveMediaHint,
+                        HookEntry::buildMessagePayload,
+                        HookEntry::post));
     }
 
     private static void startWorker(final ClassLoader classLoader) {
@@ -895,7 +1218,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
             REGISTERED_KEY = "";
             REGISTERED_DEVICE = "";
             LAST_REGISTER_SUCCESS_AT = 0L;
-            log("wechat identity changed wxid=" + wxid);
+            log("wechat identity changed wxid=" + redactedId(wxid));
         }
         CURRENT_WXID = wxid;
         CURRENT_NICKNAME = nickname;
@@ -1018,7 +1341,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         REGISTERED_DEVICE = device;
         LAST_REGISTER_SUCCESS_AT = System.currentTimeMillis();
         config.device = device;
-        log("module registered device=" + device + " wxid=" + config.selfWxid);
+        log("module registered device=" + device + " wxid=" + redactedId(config.selfWxid));
         return true;
     }
 
@@ -1184,11 +1507,26 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
                 int messageType = type <= 0 ? 1 : type;
                 Long serverId = msgSvrId > 0L ? Long.valueOf(msgSvrId) : null;
-                String mediaHint = resolveMediaHint(db, messageType, Long.valueOf(msgId), serverId, imgPath);
-                MessagePayload payload = buildMessagePayload(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), msgId, createTime, messageType, mediaHint);
+                String mediaHint = MEDIA_ATTACHMENT_CONTROLLER.resolveMediaHint(
+                        db,
+                        messageType,
+                        Long.valueOf(msgId),
+                        serverId,
+                        imgPath);
+                MessagePayload payload = buildMessagePayload(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), Long.valueOf(msgId), serverId, Long.valueOf(createTime), messageType, mediaHint);
                 post(config, payload);
-                rememberMediaUpload(payload);
-                scheduleMediaRetryIfNeeded(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), msgId, serverId, createTime, messageType, mediaHint, payload);
+                MEDIA_RETRY_SCHEDULER.rememberUploaded(payload);
+                MEDIA_RETRY_SCHEDULER.scheduleIfNeeded(
+                        config != null && config.mediaUploadEnabled,
+                        Long.valueOf(msgId),
+                        serverId,
+                        talker,
+                        content,
+                        isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0),
+                        Long.valueOf(createTime),
+                        messageType,
+                        mediaHint,
+                        payload);
                 count++;
             }
         } finally {
@@ -1197,136 +1535,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return count;
     }
 
-    private static void scheduleMediaRetryIfNeeded(
-            BridgeConfig config,
-            String talker,
-            String content,
-            Integer isSend,
-            Long msgId,
-            Long msgSvrId,
-            Long createTime,
-            int type,
-            String mediaHint,
-            MessagePayload firstPayload) {
-        if (!shouldScheduleMediaRetry(config, msgId, type, firstPayload)) {
-            return;
-        }
-        final long recordId = msgId.longValue();
-        if (!markMediaRetryScheduled(recordId)) {
-            return;
-        }
-        Thread worker = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                retryMediaUpload(recordId, msgSvrId, talker, content, isSend, createTime, type, mediaHint);
-            }
-        }, "WechatGatewayMediaRetry-" + recordId);
-        worker.setDaemon(true);
-        worker.start();
-    }
-
-    private static boolean shouldScheduleMediaRetry(BridgeConfig config, Long msgId, int type, MessagePayload firstPayload) {
-        if (config == null || !config.mediaUploadEnabled || msgId == null || msgId <= 0) {
-            return false;
-        }
-        if (hasRememberedMediaUpload(msgId.longValue())) {
-            return false;
-        }
-        if (firstPayload != null && !isBlank(firstPayload.mediaBase64)) {
-            return false;
-        }
-        String kind = mediaKindForMessageType(type);
-        return !isBlank(kind);
-    }
-
-    private static void retryMediaUpload(long recordId, Long msgSvrId, String talker, String content, Integer isSend, Long createTime, int type, String mediaHint) {
-        for (int i = 0; i < MEDIA_RETRY_DELAYS_MS.length; i++) {
-            sleepQuietly(MEDIA_RETRY_DELAYS_MS[i]);
-            if (hasRememberedMediaUpload(recordId)) {
-                return;
-            }
-            try {
-                BridgeConfig config = BridgeConfig.load(bridgeContext());
-                if (!config.enabled || !config.mediaUploadEnabled || isBlank(config.baseUrl) || isBlank(config.apiKey)) {
-                    return;
-                }
-                if (!isTargetAndroidUser(config) || !bindRuntimeIdentity(config) || !ensureRegistered(config)) {
-                    return;
-                }
-                String latestHint = resolveMediaHint(LAST_DATABASE, type, Long.valueOf(recordId), msgSvrId, mediaHint);
-                MessagePayload payload = buildMessagePayload(config, talker, content, isSend, recordId, createTime, type, latestHint);
-                if (isBlank(payload.mediaBase64)) {
-                    continue;
-                }
-                post(config, payload);
-                rememberMediaUpload(payload);
-                log("media retry uploaded type=" + type
-                        + " msgId=" + recordId
-                        + " attempt=" + (i + 1)
-                        + " size=" + payload.mediaSize);
-                return;
-            } catch (Throwable t) {
-                logMediaRetryFailure(recordId, type, i + 1, t);
-            }
-        }
-        log("media retry exhausted type=" + type + " msgId=" + recordId);
-    }
-
     private static void sleepQuietly(long millis) {
         try {
             Thread.sleep(Math.max(0L, millis));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         }
-    }
-
-    private static boolean markMediaRetryScheduled(long chatRecordId) {
-        if (chatRecordId <= 0) {
-            return false;
-        }
-        synchronized (MEDIA_RETRY_SCHEDULED_IDS) {
-            if (MEDIA_RETRY_SCHEDULED_IDS.size() > 1024) {
-                MEDIA_RETRY_SCHEDULED_IDS.clear();
-            }
-            if (MEDIA_RETRY_SCHEDULED_IDS.contains(chatRecordId)) {
-                return false;
-            }
-            MEDIA_RETRY_SCHEDULED_IDS.add(chatRecordId);
-            return true;
-        }
-    }
-
-    private static void rememberMediaUpload(MessagePayload payload) {
-        if (payload == null || payload.chatRecordId <= 0 || isBlank(payload.mediaBase64)) {
-            return;
-        }
-        synchronized (MEDIA_UPLOAD_REPORTED_IDS) {
-            if (MEDIA_UPLOAD_REPORTED_IDS.size() > 1024) {
-                MEDIA_UPLOAD_REPORTED_IDS.clear();
-            }
-            MEDIA_UPLOAD_REPORTED_IDS.add(payload.chatRecordId);
-        }
-    }
-
-    private static boolean hasRememberedMediaUpload(long chatRecordId) {
-        if (chatRecordId <= 0) {
-            return false;
-        }
-        synchronized (MEDIA_UPLOAD_REPORTED_IDS) {
-            return MEDIA_UPLOAD_REPORTED_IDS.contains(chatRecordId);
-        }
-    }
-
-    private static void logMediaRetryFailure(long recordId, int type, int attempt, Throwable t) {
-        long now = System.currentTimeMillis();
-        if (now - LAST_MEDIA_RETRY_FAIL_LOG_AT < 30000L) {
-            return;
-        }
-        LAST_MEDIA_RETRY_FAIL_LOG_AT = now;
-        log("media retry failed type=" + type
-                + " msgId=" + recordId
-                + " attempt=" + attempt
-                + " error=" + shortError(rootCause(t)));
     }
 
     private static Throwable rootCause(Throwable t) {
@@ -1357,7 +1571,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return type > 0;
     }
 
-    private static MessagePayload buildMessagePayload(BridgeConfig config, String talker, String content, Integer isSend, Long msgId, Long createTime, int type, String mediaHint) {
+    private static MessagePayload buildMessagePayload(BridgeConfig config, String talker, String content, Integer isSend, Long msgId, Long msgSvrId, Long createTime, int type, String mediaHint) {
         MessagePayload payload = new MessagePayload();
         String normalizedTalker = talker == null ? "" : talker.trim();
         boolean chatroom = isChatroomTalker(normalizedTalker);
@@ -1375,7 +1589,18 @@ public final class HookEntry implements IXposedHookLoadPackage {
         payload.messageType = type;
         payload.rawXml = rawXmlPayload(normalizedContent, type);
         payload.createTime = normalizeCreateTime(createTime);
-        attachMedia(config, payload, type, mediaHint, payload.createTime, normalizedTalker, content);
+        MEDIA_ATTACHMENT_CONTROLLER.attachMedia(
+                LAST_DATABASE,
+                config,
+                payload,
+                isSend,
+                type,
+                mediaHint,
+                msgId,
+                msgSvrId,
+                payload.createTime,
+                normalizedTalker,
+                content);
 
         boolean sent = isSend != null && isSend == 1;
         if (sent) {
@@ -1392,278 +1617,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return payload;
     }
 
-    private static void attachMedia(
-            BridgeConfig config,
-            MessagePayload payload,
-            int type,
-            String mediaHint,
-            long createTime,
-            String talker,
-            String content) {
-        String kind = mediaKindForMessageType(type);
-        if (isBlank(kind)) {
-            return;
-        }
-        payload.mediaKind = kind;
-        if (!config.mediaUploadEnabled) {
-            return;
-        }
-        String emojiMd5 = type == 47 ? emojiMd5FromContent(talker, content) : "";
-        File file = resolveMediaFile(type, mediaHint, createTime, emojiMd5);
-        if (file == null || !file.isFile()) {
-            if (type == 34 || type == 43 || type == 47 || type == 62) {
-                log("media file not found type=" + type
-                        + " msgId=" + payload.chatRecordId
-                        + " hintPresent=" + !isBlank(mediaHint));
-            }
-            return;
-        }
-        long length = file.length();
-        if (length <= 0 || length > config.mediaUploadLimitBytes) {
-            log("skip media upload type=" + type + " size=" + length + " path=" + file.getAbsolutePath());
-            return;
-        }
-        try {
-            byte[] bytes = readFileBytes(file, config.mediaUploadLimitBytes);
-            String mime = detectMediaMime(type, file, bytes);
-            payload.mediaMime = mime;
-            payload.mediaName = mediaUploadName(file, mime, payload.id);
-            payload.mediaSize = bytes.length;
-            payload.mediaBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
-        } catch (Throwable t) {
-            log("read media failed type=" + type + " hint=" + mediaHint + " error=" + shortError(t));
-        }
+    private static ClassLoader wechatRuntimeClassLoader() {
+        ClassLoader current = WECHAT_CLASS_LOADER == null ? HookEntry.class.getClassLoader() : WECHAT_CLASS_LOADER;
+        return runtimeClassLoader(current);
     }
 
-    private static String mediaKindForMessageType(int type) {
-        switch (type) {
-            case 3:
-                return "image";
-            case 34:
-                return "voice";
-            case 43:
-            case 62:
-                return "video";
-            case 47:
-                return "emoji";
-            case 48:
-                return "location";
-            case 49:
-            case MESSAGE_TYPE_FILE_TRANSFER:
-                return "file";
-            default:
-                return "";
-        }
-    }
-
-    private static String resolveMediaHint(Object db, int type, Long msgId, Long msgSvrId, String mediaHint) {
-        if (type == 34 && db != null) {
-            String voiceHint = voiceMediaHintFromInfoTable(db, msgId, msgSvrId);
-            if (!isBlank(voiceHint)) {
-                return voiceHint;
-            }
-        }
-        if ((type == 43 || type == 62) && db != null) {
-            String videoHint = videoMediaHintFromInfoTable(db, msgId, msgSvrId);
-            if (!isBlank(videoHint)) {
-                return videoHint;
-            }
-        }
-        return mediaHint;
-    }
-
-    private static String videoMediaHintFromInfoTable(Object db, Long msgId, Long msgSvrId) {
-        List<String> columns = tableColumns(db, "videoinfo2");
-        if (columns.isEmpty()) {
-            return "";
-        }
-        List<String> valueColumns = existingColumns(columns, new String[]{
-                "filename", "fileName", "videoPath", "videopath", "fullPath", "fullpath", "path", "thumbPath", "thumbpath"
-        });
-        if (valueColumns.isEmpty()) {
-            return "";
-        }
-        List<String> idColumns = existingColumns(columns, new String[]{
-                "msglocalid", "msgLocalId", "msgid", "msgId", "msgsvrid", "msgSvrId", "msgSvrID", "svrid", "svrId"
-        });
-        if (idColumns.isEmpty()) {
-            return "";
-        }
-        List<Long> ids = new ArrayList<>();
-        addPositiveId(ids, msgId);
-        addPositiveId(ids, msgSvrId);
-        for (String idColumn : idColumns) {
-            for (Long id : ids) {
-                String hint = queryVideoInfoHint(db, idColumn, id.longValue(), valueColumns);
-                if (!isBlank(hint)) {
-                    return hint;
-                }
-            }
-        }
-        return "";
-    }
-
-    private static String voiceMediaHintFromInfoTable(Object db, Long msgId, Long msgSvrId) {
-        String[] tables = new String[]{"voiceinfo", "voiceinfo2"};
-        for (String table : tables) {
-            List<String> columns = tableColumns(db, table);
-            if (columns.isEmpty()) {
-                continue;
-            }
-            List<String> valueColumns = existingColumns(columns, new String[]{
-                    "FileName", "filename", "fileName", "file_name", "voicePath", "voicepath",
-                    "fullPath", "fullpath", "path", "localPath", "filePath", "filepath",
-                    "amrPath", "silkPath"
-            });
-            if (valueColumns.isEmpty()) {
-                continue;
-            }
-            List<String> idColumns = existingColumns(columns, new String[]{
-                    "MsgLocalId", "msgLocalId", "msglocalid",
-                    "MsgId", "msgId", "msgid", "msgSvrId", "MsgSvrId", "MsgSvrID",
-                    "msgsvrid", "svrId", "svrid"
-            });
-            if (idColumns.isEmpty()) {
-                continue;
-            }
-            List<Long> ids = new ArrayList<>();
-            addPositiveId(ids, msgId);
-            addPositiveId(ids, msgSvrId);
-            for (String idColumn : idColumns) {
-                for (Long id : ids) {
-                    String hint = queryMediaInfoHint(db, table, idColumn, id.longValue(), valueColumns);
-                    if (!isBlank(hint)) {
-                        return hint;
-                    }
-                }
-            }
-        }
-        return "";
-    }
-
-    private static void addPositiveId(List<Long> ids, Long value) {
-        if (value == null || value <= 0L) {
-            return;
-        }
-        for (Long existing : ids) {
-            if (existing.longValue() == value.longValue()) {
-                return;
-            }
-        }
-        ids.add(value);
-    }
-
-    private static String queryVideoInfoHint(Object db, String idColumn, long id, List<String> valueColumns) {
-        return queryMediaInfoHint(db, "videoinfo2", idColumn, id, valueColumns);
-    }
-
-    private static String queryMediaInfoHint(Object db, String table, String idColumn, long id, List<String> valueColumns) {
-        if (id <= 0L) {
-            return "";
-        }
-        String sql = "SELECT " + joinIdentifiers(valueColumns)
-                + " FROM " + sqlIdentifier(table)
-                + " WHERE " + sqlIdentifier(idColumn) + "=? LIMIT 1";
-        Object cursor = null;
-        try {
-            cursor = rawQuery(db, sql, new String[]{String.valueOf(id)});
-            if (cursor == null) {
-                return "";
-            }
-            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
-            if (!Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
-                return "";
-            }
-            for (int i = 0; i < valueColumns.size(); i++) {
-                String value = stringColumn(cursor, i);
-                if (!isBlank(value)) {
-                    return value;
-                }
-            }
-            return "";
-        } catch (Throwable ignored) {
-            return "";
-        } finally {
-            closeQuietly(cursor);
-        }
-    }
-
-    private static List<String> tableColumns(Object db, String table) {
-        List<String> columns = new ArrayList<>();
-        Object cursor = null;
-        try {
-            cursor = rawQuery(db, "PRAGMA table_info(" + sqlIdentifier(table) + ")", new String[]{});
-            if (cursor == null) {
-                return columns;
-            }
-            Method moveToNext = findNoArgMethod(cursor.getClass(), "moveToNext");
-            while (Boolean.TRUE.equals(moveToNext.invoke(cursor))) {
-                addMediaCandidate(columns, stringColumn(cursor, 1));
-            }
-            return columns;
-        } catch (Throwable ignored) {
-            return columns;
-        } finally {
-            closeQuietly(cursor);
-        }
-    }
-
-    private static List<String> existingColumns(List<String> columns, String[] candidates) {
-        List<String> existing = new ArrayList<>();
-        if (columns == null || candidates == null) {
-            return existing;
-        }
-        for (String candidate : candidates) {
-            String column = existingColumn(columns, candidate);
-            if (!isBlank(column)) {
-                addMediaCandidate(existing, column);
-            }
-        }
-        return existing;
-    }
-
-    private static String existingColumn(List<String> columns, String candidate) {
-        if (isBlank(candidate)) {
-            return "";
-        }
-        for (String column : columns) {
-            if (!isBlank(column) && column.equalsIgnoreCase(candidate)) {
-                return column;
-            }
-        }
-        return "";
-    }
-
-    private static String joinIdentifiers(List<String> identifiers) {
-        StringBuilder builder = new StringBuilder();
-        for (String identifier : identifiers) {
-            if (builder.length() > 0) {
-                builder.append(',');
-            }
-            builder.append(sqlIdentifier(identifier));
-        }
-        return builder.toString();
-    }
-
-    private static String sqlIdentifier(String name) {
-        if (name == null) {
-            return "``";
-        }
-        return "`" + name.replace("`", "``") + "`";
-    }
-
-    private static File resolveMediaFile(int type, String mediaHint, long createTime, String emojiMd5) {
-        List<String> names = mediaCandidateNames(type, mediaHint);
-        if (type == 47) {
-            addEmojiCandidateVariants(names, emojiMd5);
-        }
-        if (names.isEmpty() && type != 34) {
-            return null;
-        }
-        File direct = directMediaFile(mediaHint);
-        if (direct != null) {
-            return direct;
-        }
+    private static File wechatAppRoot() {
         Context context = APP_CONTEXT;
         if (context == null) {
             Object app = currentApplication();
@@ -1671,485 +1630,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 context = (Context) app;
             }
         }
-        if (context == null) {
-            return null;
-        }
-        File appRoot = context.getFilesDir() == null ? null : context.getFilesDir().getParentFile();
-        if (appRoot == null) {
-            return null;
-        }
-        String[] roots = mediaSearchRoots(type);
-        File microMsgRoot = new File(appRoot, "MicroMsg");
-        if (!names.isEmpty()) {
-            File found = findMediaInProfileRoots(microMsgRoot, roots, names);
-            if (found != null) {
-                if (type == 47) {
-                    log("emoji media selected file=" + found.getName() + " size=" + found.length());
-                }
-                return found;
-            }
-        }
-        if (type == 47) {
-            File found = findEmojiMediaOutsideProfile(appRoot, names);
-            if (found != null) {
-                log("emoji media selected file=" + found.getName() + " size=" + found.length());
-                return found;
-            }
-            logEmojiInfoDiagnostic(emojiMd5);
-        }
-        if (type == 34) {
-            return findRecentVoiceFile(microMsgRoot, createTime);
-        }
-        if (type == 43 || type == 62) {
-            return findMediaInProfileRoots(new File(appRoot, "cache"), videoCacheSearchRoots(), names);
-        }
-        return null;
-    }
-
-    private static File findMediaInProfileRoots(File profileRoot, String[] roots, List<String> names) {
-        File[] profiles = profileRoot == null ? null : profileRoot.listFiles();
-        if (profiles == null) {
-            return null;
-        }
-        for (File profile : profiles) {
-            if (profile == null || !profile.isDirectory()) {
-                continue;
-            }
-            for (String rootName : roots) {
-                File found = findNamedFile(new File(profile, rootName), names, 6, new int[]{0});
-                if (found != null) {
-                    return found;
-                }
-            }
-        }
-        return null;
-    }
-
-    private static File directMediaFile(String mediaHint) {
-        if (isBlank(mediaHint)) {
-            return null;
-        }
-        String[] candidates = new String[]{mediaHint.trim(), normalizeMediaHint(mediaHint)};
-        Context context = APP_CONTEXT;
-        File appRoot = null;
-        if (context != null && context.getFilesDir() != null) {
-            appRoot = context.getFilesDir().getParentFile();
-        }
-        for (String candidate : candidates) {
-            if (isBlank(candidate)) {
-                continue;
-            }
-            File direct = new File(candidate);
-            if (direct.isFile()) {
-                return direct;
-            }
-            if (appRoot != null) {
-                File relative = new File(appRoot, candidate);
-                if (relative.isFile()) {
-                    return relative;
-                }
-            }
-        }
-        return null;
-    }
-
-    private static List<String> mediaCandidateNames(int type, String mediaHint) {
-        List<String> names = new ArrayList<>();
-        String normalized = normalizeMediaHint(mediaHint);
-        addMediaCandidate(names, normalized);
-        int slash = Math.max(normalized.lastIndexOf('/'), normalized.lastIndexOf(File.separatorChar));
-        if (slash >= 0 && slash + 1 < normalized.length()) {
-            addMediaCandidate(names, normalized.substring(slash + 1));
-        }
-        List<String> snapshot = new ArrayList<>(names);
-        if (type == 43 || type == 62) {
-            List<String> videoNames = new ArrayList<>();
-            for (String candidate : snapshot) {
-                if (isBlank(candidate)) {
-                    continue;
-                }
-                if (candidate.startsWith("th_") && candidate.length() > 3) {
-                    String withoutThumb = candidate.substring(3);
-                    addVideoCandidateVariants(videoNames, withoutThumb);
-                }
-                addVideoCandidateVariants(videoNames, candidate);
-            }
-            for (String candidate : snapshot) {
-                addMediaCandidate(videoNames, candidate);
-            }
-            return videoNames;
-        }
-        for (String candidate : snapshot) {
-            if (type == 3 && candidate.startsWith("th_") && candidate.length() > 3) {
-                addMediaCandidate(names, candidate.substring(3));
-            }
-            if (type == 34) {
-                String base = stripKnownMediaExtension(candidate);
-                if (!base.equals(candidate)) {
-                    addMediaCandidate(names, base);
-                }
-                addMediaCandidate(names, base + ".amr");
-                addMediaCandidate(names, base + ".silk");
-            }
-        }
-        return names;
-    }
-
-    private static void addVideoCandidateVariants(List<String> names, String candidate) {
-        if (isBlank(candidate)) {
-            return;
-        }
-        String value = candidate.trim();
-        addMediaCandidate(names, value);
-        String base = stripKnownMediaExtension(value);
-        if (!base.equals(value)) {
-            addMediaCandidate(names, base);
-        }
-        addMediaCandidate(names, base + ".mp4");
-        if (!base.startsWith("video_")) {
-            addMediaCandidate(names, "video_" + base);
-            addMediaCandidate(names, "video_" + base + ".mp4");
-        }
-    }
-
-    private static void addEmojiCandidateVariants(List<String> names, String emojiMd5) {
-        if (isBlank(emojiMd5)) {
-            return;
-        }
-        String md5 = emojiMd5.trim().toLowerCase(Locale.US);
-        addMediaCandidate(names, md5);
-        addMediaCandidate(names, md5 + ".gif");
-        addMediaCandidate(names, md5 + ".png");
-        addMediaCandidate(names, md5 + ".webp");
-        addMediaCandidate(names, md5 + ".jpg");
-        addMediaCandidate(names, "emoji_" + md5);
-        addMediaCandidate(names, "emoji_" + md5 + ".gif");
-        addMediaCandidate(names, "emoji_" + md5 + ".png");
-        addMediaCandidate(names, "emoji_" + md5 + ".webp");
-        addMediaCandidate(names, "thumb_" + md5);
-        addMediaCandidate(names, "thumb_" + md5 + ".gif");
-        addMediaCandidate(names, "thumb_" + md5 + ".png");
-        addMediaCandidate(names, "thumb_" + md5 + ".webp");
-    }
-
-    private static String stripKnownMediaExtension(String value) {
-        if (isBlank(value)) {
-            return "";
-        }
-        String lower = value.toLowerCase(Locale.US);
-        String[] extensions = new String[]{".mp4", ".jpg", ".jpeg", ".png", ".webp", ".amr", ".silk"};
-        for (String extension : extensions) {
-            if (lower.endsWith(extension) && value.length() > extension.length()) {
-                return value.substring(0, value.length() - extension.length());
-            }
-        }
-        return value;
-    }
-
-    private static String normalizeMediaHint(String mediaHint) {
-        if (isBlank(mediaHint)) {
-            return "";
-        }
-        String value = mediaHint.trim();
-        int query = value.indexOf('?');
-        if (query >= 0) {
-            value = value.substring(0, query);
-        }
-        int scheme = value.indexOf("://");
-        if (scheme >= 0 && scheme + 3 < value.length()) {
-            value = value.substring(scheme + 3);
-        }
-        return value.trim();
-    }
-
-    private static void addMediaCandidate(List<String> names, String name) {
-        if (isBlank(name)) {
-            return;
-        }
-        String value = name.trim();
-        for (String existing : names) {
-            if (existing.equals(value)) {
-                return;
-            }
-        }
-        names.add(value);
-    }
-
-    private static String[] mediaSearchRoots(int type) {
-        switch (type) {
-            case 3:
-                return new String[]{"image2"};
-            case 34:
-                return new String[]{"voice2"};
-            case 43:
-            case 62:
-                return new String[]{"video", "c2c_temp/origin/video", "c2c_temp"};
-            case 47:
-                return emojiSearchRoots();
-            case 49:
-                return new String[]{"attachment", "openapi", "image2"};
-            default:
-                return new String[]{"image2", "voice2", "video", "attachment"};
-        }
-    }
-
-    private static String[] videoCacheSearchRoots() {
-        return new String[]{"finder/video", "video"};
-    }
-
-    private static String[] emojiSearchRoots() {
-        return new String[]{"emoji", "emoji/egg", "emoji/custom", "emoji/panel", "emoticon-user-files", "emoticon-user-core"};
-    }
-
-    private static File findEmojiMediaOutsideProfile(File appRoot, List<String> names) {
-        if (appRoot == null || names == null || names.isEmpty()) {
-            return null;
-        }
-        File found = findNamedFile(new File(appRoot, "files/public/emoji"), names, 6, new int[]{0});
-        if (found != null) {
-            return found;
-        }
-        return findNamedFile(new File(appRoot, "cache"), names, 4, new int[]{0});
-    }
-
-    private static File findRecentVoiceFile(File microMsgRoot, long createTimeSeconds) {
-        File[] profiles = microMsgRoot == null ? null : microMsgRoot.listFiles();
-        if (profiles == null) {
-            return null;
-        }
-        long now = System.currentTimeMillis();
-        long targetMs = createTimeSeconds > 0L ? createTimeSeconds * 1000L : now;
-        long minMs = Math.max(0L, targetMs - 10L * 60L * 1000L);
-        long maxMs = targetMs + 10L * 60L * 1000L;
-        RecentMediaCandidate best = new RecentMediaCandidate();
-        int[] visited = new int[]{0};
-        for (File profile : profiles) {
-            if (profile == null || !profile.isDirectory()) {
-                continue;
-            }
-            findRecentVoiceFile(new File(profile, "voice2"), minMs, maxMs, targetMs, 6, visited, best);
-        }
-        if (best.file != null) {
-            log("voice media fallback selected file=" + best.file.getName()
-                    + " size=" + best.file.length()
-                    + " modified=" + best.modifiedMs
-                    + " distanceMs=" + best.distanceMs);
-        }
-        return best.file;
-    }
-
-    private static void findRecentVoiceFile(
-            File root,
-            long minMs,
-            long maxMs,
-            long targetMs,
-            int depth,
-            int[] visited,
-            RecentMediaCandidate best) {
-        if (root == null || !root.isDirectory() || depth < 0 || visited[0] > 8000) {
-            return;
-        }
-        File[] files = root.listFiles();
-        if (files == null) {
-            return;
-        }
-        for (File file : files) {
-            if (file == null || !file.isFile()) {
-                continue;
-            }
-            visited[0]++;
-            if (!isLikelyVoiceMediaFile(file)) {
-                continue;
-            }
-            long modified = file.lastModified();
-            if (modified < minMs || modified > maxMs) {
-                continue;
-            }
-            long distance = Math.abs(modified - targetMs);
-            if (best.file == null
-                    || distance < best.distanceMs
-                    || (distance == best.distanceMs && modified > best.modifiedMs)) {
-                best.file = file;
-                best.distanceMs = distance;
-                best.modifiedMs = modified;
-            }
-        }
-        for (File file : files) {
-            if (file != null && file.isDirectory()) {
-                findRecentVoiceFile(file, minMs, maxMs, targetMs, depth - 1, visited, best);
-            }
-        }
-    }
-
-    private static boolean isLikelyVoiceMediaFile(File file) {
-        if (file == null || !file.isFile() || file.length() <= 0L) {
-            return false;
-        }
-        String name = file.getName() == null ? "" : file.getName().toLowerCase(Locale.US);
-        if (name.endsWith(".amr") || name.endsWith(".silk")) {
-            return true;
-        }
-        File parent = file.getParentFile();
-        while (parent != null) {
-            if ("voice2".equals(parent.getName())) {
-                return true;
-            }
-            parent = parent.getParentFile();
-        }
-        return false;
-    }
-
-    private static File findNamedFile(File root, List<String> names, int depth, int[] visited) {
-        if (root == null || !root.isDirectory() || depth < 0 || visited[0] > 6000) {
-            return null;
-        }
-        File[] files = root.listFiles();
-        if (files == null) {
-            return null;
-        }
-        for (File file : files) {
-            if (file == null) {
-                continue;
-            }
-            visited[0]++;
-            if (file.isFile() && mediaNameMatches(file.getName(), names)) {
-                return file;
-            }
-        }
-        for (File file : files) {
-            if (file != null && file.isDirectory()) {
-                File found = findNamedFile(file, names, depth - 1, visited);
-                if (found != null) {
-                    return found;
-                }
-            }
-        }
-        return null;
-    }
-
-    private static boolean mediaNameMatches(String fileName, List<String> names) {
-        if (isBlank(fileName)) {
-            return false;
-        }
-        for (String name : names) {
-            if (fileName.equals(name)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static byte[] readFileBytes(File file, long limit) throws IOException {
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        byte[] buffer = new byte[8192];
-        long total = 0L;
-        try (FileInputStream input = new FileInputStream(file)) {
-            int read;
-            while ((read = input.read(buffer)) != -1) {
-                total += read;
-                if (total > limit) {
-                    throw new IOException("media file exceeds limit");
-                }
-                out.write(buffer, 0, read);
-            }
-        }
-        return out.toByteArray();
-    }
-
-    private static String detectMediaMime(int type, File file, byte[] bytes) {
-        String name = file == null ? "" : file.getName().toLowerCase(Locale.US);
-        if (name.endsWith(".jpg") || name.endsWith(".jpeg") || startsWith(bytes, new byte[]{(byte) 0xff, (byte) 0xd8})) {
-            return "image/jpeg";
-        }
-        if (name.endsWith(".png") || startsWith(bytes, new byte[]{(byte) 0x89, 0x50, 0x4e, 0x47})) {
-            return "image/png";
-        }
-        if (name.endsWith(".gif") || startsWith(bytes, new byte[]{0x47, 0x49, 0x46})) {
-            return "image/gif";
-        }
-        if (name.endsWith(".webp") || containsAsciiAt(bytes, "WEBP", 8)) {
-            return "image/webp";
-        }
-        if (name.endsWith(".mp4") || containsAsciiAt(bytes, "ftyp", 4)) {
-            return "video/mp4";
-        }
-        if (name.endsWith(".amr") || startsWith(bytes, "#!AMR".getBytes(StandardCharsets.US_ASCII))) {
-            return "audio/amr";
-        }
-        if (name.endsWith(".silk") || startsWith(bytes, "#!SILK".getBytes(StandardCharsets.US_ASCII))) {
-            return "audio/silk";
-        }
-        if (type == 34) {
-            return "audio/amr";
-        }
-        if (type == 3) {
-            return "image/jpeg";
-        }
-        if (type == 43 || type == 62) {
-            return "video/mp4";
-        }
-        return "application/octet-stream";
-    }
-
-    private static boolean startsWith(byte[] bytes, byte[] prefix) {
-        if (bytes == null || prefix == null || bytes.length < prefix.length) {
-            return false;
-        }
-        for (int i = 0; i < prefix.length; i++) {
-            if (bytes[i] != prefix[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static boolean containsAsciiAt(byte[] bytes, String text, int offset) {
-        if (bytes == null || text == null || offset < 0 || bytes.length < offset + text.length()) {
-            return false;
-        }
-        byte[] expected = text.getBytes(StandardCharsets.US_ASCII);
-        for (int i = 0; i < expected.length; i++) {
-            if (bytes[offset + i] != expected[i]) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private static String mediaUploadName(File file, String mime, String id) {
-        String name = file == null ? "" : file.getName();
-        if (isBlank(name)) {
-            name = isBlank(id) ? "media" : "media-" + id;
-        }
-        if (name.indexOf('.') >= 0) {
-            return name;
-        }
-        return name + extensionForMime(mime);
-    }
-
-    private static String extensionForMime(String mime) {
-        if ("image/png".equals(mime)) {
-            return ".png";
-        }
-        if ("image/gif".equals(mime)) {
-            return ".gif";
-        }
-        if ("image/webp".equals(mime)) {
-            return ".webp";
-        }
-        if ("audio/amr".equals(mime)) {
-            return ".amr";
-        }
-        if ("audio/silk".equals(mime)) {
-            return ".silk";
-        }
-        if ("video/mp4".equals(mime)) {
-            return ".mp4";
-        }
-        if ("image/jpeg".equals(mime)) {
-            return ".jpg";
-        }
-        return ".bin";
+        return context == null || context.getFilesDir() == null ? null : context.getFilesDir().getParentFile();
     }
 
     private static String displayMessageText(String talker, String content, int type) {
@@ -2237,122 +1718,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return content.trim();
     }
 
-    private static String extractXmlField(String xml, String field) {
-        return cleanDisplayText(extractXmlFieldRaw(xml, field), 120);
-    }
-
-    private static String extractXmlAttribute(String xml, String attribute) {
-        if (isBlank(xml) || isBlank(attribute)) {
-            return "";
-        }
-        String text = xml.trim();
-        String lower = text.toLowerCase(Locale.US);
-        String name = attribute.trim().toLowerCase(Locale.US);
-        int searchFrom = 0;
-        while (searchFrom < lower.length()) {
-            int start = lower.indexOf(name, searchFrom);
-            if (start < 0) {
-                return "";
-            }
-            int before = start - 1;
-            int afterName = start + name.length();
-            boolean boundaryBefore = before < 0 || !isXmlNameChar(lower.charAt(before));
-            boolean boundaryAfter = afterName < lower.length() && lower.charAt(afterName) == '=';
-            if (!boundaryBefore || !boundaryAfter) {
-                searchFrom = afterName;
-                continue;
-            }
-            int valueStart = afterName + 1;
-            while (valueStart < text.length() && Character.isWhitespace(text.charAt(valueStart))) {
-                valueStart++;
-            }
-            if (valueStart >= text.length()) {
-                return "";
-            }
-            char quote = text.charAt(valueStart);
-            int valueEnd;
-            if (quote == '"' || quote == '\'') {
-                valueStart++;
-                valueEnd = text.indexOf(quote, valueStart);
-                if (valueEnd < 0) {
-                    return "";
-                }
-            } else {
-                valueEnd = valueStart;
-                while (valueEnd < text.length()) {
-                    char ch = text.charAt(valueEnd);
-                    if (Character.isWhitespace(ch) || ch == '/' || ch == '>') {
-                        break;
-                    }
-                    valueEnd++;
-                }
-            }
-            return stripCData(text.substring(valueStart, valueEnd)).trim();
-        }
-        return "";
-    }
-
-    private static boolean isXmlNameChar(char ch) {
-        return (ch >= 'a' && ch <= 'z')
-                || (ch >= '0' && ch <= '9')
-                || ch == '_'
-                || ch == '-'
-                || ch == ':';
-    }
-
-    private static String emojiMd5FromContent(String talker, String content) {
-        String normalized = normalizeMessageContent(talker, content, 47);
-        return firstNonBlank(
-                normalizeEmojiMd5(extractXmlAttribute(normalized, "md5")),
-                normalizeEmojiMd5(extractXmlAttribute(normalized, "androidmd5")),
-                normalizeEmojiMd5(extractXmlAttribute(normalized, "externmd5")),
-                normalizeEmojiMd5(extractXmlAttribute(content, "md5")),
-                normalizeEmojiMd5(extractXmlAttribute(content, "androidmd5")),
-                normalizeEmojiMd5(extractXmlAttribute(content, "externmd5")),
-                emojiMd5FromColonPayload(normalizeMessageText(talker, content)));
-    }
-
-    private static String normalizeEmojiMd5(String value) {
+    private static boolean containsRevokePayload(String value) {
         if (isBlank(value)) {
-            return "";
-        }
-        return value.trim().toLowerCase(Locale.US);
-    }
-
-    private static String emojiMd5FromColonPayload(String content) {
-        if (isBlank(content)) {
-            return "";
-        }
-        String text = content.trim();
-        String prefix = text;
-        int xmlStart = embeddedXmlStart(text);
-        if (xmlStart > 0) {
-            prefix = text.substring(0, xmlStart);
-        }
-        String[] parts = prefix.split(":");
-        for (String part : parts) {
-            String candidate = normalizeEmojiMd5(part);
-            if (looksLikeMd5Hex(candidate)) {
-                return candidate;
-            }
-        }
-        return "";
-    }
-
-    private static boolean looksLikeMd5Hex(String value) {
-        if (isBlank(value) || value.length() != 32) {
             return false;
         }
-        for (int i = 0; i < value.length(); i++) {
-            char ch = value.charAt(i);
-            boolean digit = ch >= '0' && ch <= '9';
-            boolean lower = ch >= 'a' && ch <= 'f';
-            boolean upper = ch >= 'A' && ch <= 'F';
-            if (!digit && !lower && !upper) {
-                return false;
-            }
-        }
-        return true;
+        String normalized = value.toLowerCase(Locale.US);
+        return normalized.contains("revokemsg") || normalized.contains("msgsvrcancel");
+    }
+
+    private static String extractXmlField(String xml, String field) {
+        return cleanDisplayText(extractXmlFieldRaw(xml, field), 120);
     }
 
     private static String extractXmlFieldRaw(String xml, String field) {
@@ -2438,6 +1813,38 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return 0L;
     }
 
+    private static long[] uniquePositiveLongs(long... values) {
+        if (values == null || values.length == 0) {
+            return new long[0];
+        }
+        long[] tmp = new long[values.length];
+        int count = 0;
+        for (long value : values) {
+            if (value <= 0L) {
+                continue;
+            }
+            boolean exists = false;
+            for (int i = 0; i < count; i++) {
+                if (tmp[i] == value) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                tmp[count++] = value;
+            }
+        }
+        long[] result = new long[count];
+        for (int i = 0; i < count; i++) {
+            result[i] = tmp[i];
+        }
+        return result;
+    }
+
+    private static boolean isLongParameter(Class<?> type) {
+        return type == long.class || type == Long.class;
+    }
+
     private static int firstPositiveInt(int... values) {
         if (values == null) {
             return 0;
@@ -2480,6 +1887,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static boolean isChatroomTalker(String talker) {
         return !isBlank(talker) && talker.toLowerCase(Locale.US).endsWith("@chatroom");
+    }
+
+    private static boolean sameTalker(String left, String right) {
+        String a = left == null ? "" : left.trim();
+        String b = right == null ? "" : right.trim();
+        return !a.isEmpty() && a.equals(b);
     }
 
     private static String normalizeMessageText(String talker, String content) {
@@ -2942,8 +2355,16 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return;
         }
 
-        JSONArray ackItems = handleOutboxItems(items, classLoader, config);
-        if (ackItems.length() == 0) {
+        handleOutboxItems(items, classLoader, config, new OutboxAckSink() {
+            @Override
+            public void ack(JSONArray ackItems) throws Exception {
+                postOutboxAck(config, ackItems);
+            }
+        });
+    }
+
+    private static void postOutboxAck(BridgeConfig config, JSONArray ackItems) throws Exception {
+        if (ackItems == null || ackItems.length() == 0) {
             return;
         }
         JSONObject ackBody = new JSONObject();
@@ -2952,6 +2373,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         ackBody.put("wxid", config.selfWxid);
         ackBody.put("items", ackItems);
         postJson(config, "/module/outbox/ack", ackBody.toString());
+        log("outbox ack posted items=" + ackItems.length());
     }
 
     private static boolean runOutboxWebSocket(BridgeConfig config, ClassLoader classLoader) {
@@ -3022,18 +2444,12 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 JSONObject root = new JSONObject(new String(frame.payload, StandardCharsets.UTF_8));
                 String type = root.optString("type", "");
                 if ("outbox".equals(type)) {
-                    JSONArray ackItems = handleOutboxItems(root.optJSONArray("items"), classLoader, config);
-                    if (ackItems.length() > 0) {
-                        JSONObject ackBody = new JSONObject();
-                        ackBody.put("type", "ack");
-                        JSONObject ack = new JSONObject();
-                        ack.put("api_key", config.apiKey);
-                        ack.put("device", config.device);
-                        ack.put("wxid", config.selfWxid);
-                        ack.put("items", ackItems);
-                        ackBody.put("ack", ack);
-                        writeWebSocketText(output, ackBody.toString());
-                    }
+                    handleOutboxItems(root.optJSONArray("items"), classLoader, config, new OutboxAckSink() {
+                        @Override
+                        public void ack(JSONArray ackItems) throws Exception {
+                            writeOutboxAck(output, config, ackItems);
+                        }
+                    });
                 } else if ("ready".equals(type)) {
                     log("outbox websocket ready");
                 } else if ("error".equals(type)) {
@@ -3043,62 +2459,269 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
+    private static void writeOutboxAck(OutputStream output, BridgeConfig config, JSONArray ackItems) throws Exception {
+        if (ackItems == null || ackItems.length() == 0) {
+            return;
+        }
+        JSONObject ackBody = new JSONObject();
+        ackBody.put("type", "ack");
+        JSONObject ack = new JSONObject();
+        ack.put("api_key", config.apiKey);
+        ack.put("device", config.device);
+        ack.put("wxid", config.selfWxid);
+        ack.put("items", ackItems);
+        ackBody.put("ack", ack);
+        writeWebSocketText(output, ackBody.toString());
+        log("outbox websocket ack posted items=" + ackItems.length());
+    }
+
     private static boolean configChanged(BridgeConfig config) {
         BridgeConfig latest = BridgeConfig.load(bridgeContext());
         return !String.valueOf(config.signature).equals(String.valueOf(latest.signature));
     }
 
     private static JSONArray handleOutboxItems(JSONArray items, ClassLoader classLoader, BridgeConfig config) throws Exception {
+        return handleOutboxItems(items, classLoader, config, null);
+    }
+
+    private static JSONArray handleOutboxItems(
+            JSONArray items,
+            ClassLoader classLoader,
+            BridgeConfig config,
+            OutboxAckSink ackSink) throws Exception {
+        List<OutboxWorkItem> workItems = outboxWorkItems(items);
         JSONArray ackItems = new JSONArray();
-        if (items == null) {
+        if (workItems.isEmpty()) {
             return ackItems;
         }
-        for (int i = 0; i < items.length(); i++) {
-            JSONObject item = items.getJSONObject(i);
-            long id = item.optLong("id", 0);
-            String wxid = item.optString("wxid", "");
-            String text = item.optString("text", "");
-            String kind = item.optString("kind", "");
-            if (isBlank(kind)) {
-                kind = isBlank(item.optString("media_kind", "")) ? "text" : item.optString("media_kind", "");
+
+        int parallelism = normalizedOutboxParallelism(config.outboxParallelism, workItems.size());
+        List<OutboxAckResult> results = parallelism <= 1
+                ? handleOutboxWorkItemsSerial(workItems, classLoader, config, ackSink)
+                : handleOutboxWorkItemsParallel(workItems, classLoader, config, parallelism, ackSink);
+        Collections.sort(results, new Comparator<OutboxAckResult>() {
+            @Override
+            public int compare(OutboxAckResult left, OutboxAckResult right) {
+                return left.index - right.index;
             }
-            kind = kind.trim().toLowerCase(Locale.US);
+        });
+        for (OutboxAckResult result : results) {
+            ackItems.put(result.ack);
+        }
+        return ackItems;
+    }
+
+    private static List<OutboxWorkItem> outboxWorkItems(JSONArray items) {
+        List<OutboxWorkItem> workItems = new ArrayList<>();
+        if (items == null) {
+            return workItems;
+        }
+        for (int i = 0; i < items.length(); i++) {
+            JSONObject item = items.optJSONObject(i);
+            if (item == null) {
+                continue;
+            }
+            long id = item.optLong("id", 0);
             if (id <= 0) {
                 continue;
             }
-            SendResult result;
-            if (isBlank(wxid)) {
-                result = SendResult.failed("wxid is required");
-            } else if ("text".equals(kind)) {
-                result = isBlank(text)
-                        ? SendResult.failed("text is required")
-                        : sendText(classLoader, wxid, text);
-            } else if ("image".equals(kind)) {
-                result = sendImageAction(config, classLoader, wxid, item);
-            } else if ("video".equals(kind)) {
-                result = sendVideoAction(config, classLoader, wxid, item);
-            } else if ("voice".equals(kind)) {
-                result = sendVoiceAction(config, classLoader, wxid, item);
-            } else if ("file".equals(kind)) {
-                result = sendFileAction(config, classLoader, wxid, item);
-            } else if ("emoji".equals(kind)) {
-                result = sendEmojiAction(config, classLoader, wxid, item);
-            } else if ("location".equals(kind)) {
-                result = sendLocationAction(config, classLoader, wxid, text, item);
-            } else if ("quote".equals(kind)) {
-                result = sendQuoteAction(config, classLoader, wxid, text, item);
-            } else if ("link".equals(kind)) {
-                result = sendLinkAction(config, classLoader, wxid, text, item);
-            } else if ("mini_program".equals(kind)) {
-                result = sendMiniProgramAction(config, classLoader, wxid, text, item);
-            } else if ("chat_history".equals(kind)) {
-                result = sendChatHistoryAction(config, classLoader, wxid, text, item);
-            } else {
-                result = SendResult.failed("unsupported outbox kind: " + kind);
-            }
-            ackItems.put(outboxAck(id, result));
+            workItems.add(new OutboxWorkItem(i, id, item));
         }
-        return ackItems;
+        return workItems;
+    }
+
+    private static List<OutboxAckResult> handleOutboxWorkItemsSerial(
+            List<OutboxWorkItem> workItems,
+            ClassLoader classLoader,
+            BridgeConfig config,
+            OutboxAckSink ackSink) throws Exception {
+        List<OutboxAckResult> results = new ArrayList<>();
+        for (OutboxWorkItem workItem : workItems) {
+            OutboxAckResult result = handleOutboxWorkItem(workItem, classLoader, config);
+            if (ackSink == null) {
+                results.add(result);
+            } else {
+                JSONArray ackItems = new JSONArray();
+                ackItems.put(result.ack);
+                ackSink.ack(ackItems);
+            }
+        }
+        return results;
+    }
+
+    private static List<OutboxAckResult> handleOutboxWorkItemsParallel(
+            List<OutboxWorkItem> workItems,
+            final ClassLoader classLoader,
+            final BridgeConfig config,
+            int parallelism,
+            final OutboxAckSink ackSink) throws Exception {
+        Map<String, List<OutboxWorkItem>> lanes = new LinkedHashMap<>();
+        for (OutboxWorkItem workItem : workItems) {
+            String laneKey = outboxLaneKey(workItem.item);
+            List<OutboxWorkItem> laneItems = lanes.get(laneKey);
+            if (laneItems == null) {
+                laneItems = new ArrayList<>();
+                lanes.put(laneKey, laneItems);
+            }
+            laneItems.add(workItem);
+        }
+
+        int threadCount = Math.min(parallelism, lanes.size());
+        if (threadCount <= 1) {
+            return handleOutboxWorkItemsSerial(workItems, classLoader, config, ackSink);
+        }
+        log("outbox parallel dispatch items=" + workItems.size()
+                + " lanes=" + lanes.size()
+                + " parallelism=" + threadCount);
+
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount, new ThreadFactory() {
+            private int index = 1;
+
+            @Override
+            public Thread newThread(Runnable runnable) {
+                Thread thread = new Thread(runnable, "wechat-observatory-outbox-send-" + index++);
+                thread.setDaemon(true);
+                return thread;
+            }
+        });
+        CompletionService<List<OutboxAckResult>> completionService = new ExecutorCompletionService<>(executor);
+        int submitted = 0;
+        try {
+            for (final List<OutboxWorkItem> laneItems : lanes.values()) {
+                completionService.submit(new Callable<List<OutboxAckResult>>() {
+                    @Override
+                    public List<OutboxAckResult> call() throws Exception {
+                        return handleOutboxWorkItemsSerial(laneItems, classLoader, config, null);
+                    }
+                });
+                submitted++;
+            }
+
+            List<OutboxAckResult> results = new ArrayList<>();
+            for (int i = 0; i < submitted; i++) {
+                try {
+                    List<OutboxAckResult> laneResults = completionService.take().get();
+                    if (ackSink == null) {
+                        results.addAll(laneResults);
+                    } else {
+                        JSONArray ackItems = new JSONArray();
+                        for (OutboxAckResult result : laneResults) {
+                            ackItems.put(result.ack);
+                        }
+                        ackSink.ack(ackItems);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause() == null ? e : e.getCause();
+                    throw new Exception("outbox parallel lane failed: " + shortError(cause), cause);
+                }
+            }
+            return results;
+        } finally {
+            executor.shutdown();
+        }
+    }
+
+    private static OutboxAckResult handleOutboxWorkItem(
+            OutboxWorkItem workItem,
+            ClassLoader classLoader,
+            BridgeConfig config) throws Exception {
+        SendResult result;
+        try {
+            result = executeOutboxItem(workItem.item, classLoader, config);
+        } catch (Throwable t) {
+            result = SendResult.failed("outbox item failed: " + shortError(t));
+        }
+        return new OutboxAckResult(workItem.index, outboxAck(workItem.id, result));
+    }
+
+    private static SendResult executeOutboxItem(JSONObject item, ClassLoader classLoader, BridgeConfig config) {
+        String wxid = item.optString("wxid", "");
+        String text = item.optString("text", "");
+        String kind = item.optString("kind", "");
+        if (isBlank(kind)) {
+            kind = isBlank(item.optString("media_kind", "")) ? "text" : item.optString("media_kind", "");
+        }
+        kind = kind.trim().toLowerCase(Locale.US);
+        if (isBlank(wxid)) {
+            return SendResult.failed("wxid is required");
+        } else if ("text".equals(kind)) {
+            return isBlank(text)
+                    ? SendResult.failed("text is required")
+                    : sendText(config, classLoader, wxid, text);
+        } else if ("image".equals(kind)) {
+            return sendImageAction(config, classLoader, wxid, item);
+        } else if ("video".equals(kind)) {
+            return sendVideoAction(config, classLoader, wxid, item);
+        } else if ("voice".equals(kind)) {
+            return sendVoiceAction(config, classLoader, wxid, item);
+        } else if ("file".equals(kind)) {
+            return sendFileAction(config, classLoader, wxid, item);
+        } else if ("emoji".equals(kind)) {
+            return sendEmojiAction(config, classLoader, wxid, item);
+        } else if ("location".equals(kind)) {
+            return sendLocationAction(config, classLoader, wxid, text, item);
+        } else if ("quote".equals(kind)) {
+            return sendQuoteAction(config, classLoader, wxid, text, item);
+        } else if ("link".equals(kind)) {
+            return sendLinkAction(config, classLoader, wxid, text, item);
+        } else if ("mini_program".equals(kind)) {
+            return sendMiniProgramAction(config, classLoader, wxid, text, item);
+        } else if ("chat_history".equals(kind)) {
+            return sendChatHistoryAction(config, classLoader, wxid, text, item);
+        } else if ("revoke".equals(kind)) {
+            return sendRevokeAction(config, classLoader, wxid, item);
+        }
+        return SendResult.failed("unsupported outbox kind: " + kind);
+    }
+
+    private static int normalizedOutboxParallelism(int configured, int itemCount) {
+        if (itemCount <= 1) {
+            return 1;
+        }
+        int value = configured;
+        if (value < 1) {
+            value = 1;
+        } else if (value > 8) {
+            value = 8;
+        }
+        return Math.min(value, itemCount);
+    }
+
+    private static String outboxLaneKey(JSONObject item) {
+        String wxid = item.optString("wxid", "").trim();
+        if (!isBlank(wxid)) {
+            return wxid;
+        }
+        return "outbox:" + item.optLong("id", 0L);
+    }
+
+    private static final class OutboxWorkItem {
+        final int index;
+        final long id;
+        final JSONObject item;
+
+        OutboxWorkItem(int index, long id, JSONObject item) {
+            this.index = index;
+            this.id = id;
+            this.item = item;
+        }
+    }
+
+    private static final class OutboxAckResult {
+        final int index;
+        final JSONObject ack;
+
+        OutboxAckResult(int index, JSONObject ack) {
+            this.index = index;
+            this.ack = ack;
+        }
+    }
+
+    private interface OutboxAckSink {
+        void ack(JSONArray ackItems) throws Exception;
     }
 
     private static JSONObject outboxAck(long id, SendResult result) throws Exception {
@@ -3115,133 +2738,31 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static SendResult sendImageAction(BridgeConfig config, ClassLoader classLoader, String wxid, JSONObject item) {
-        File mediaFile = null;
-        try {
-            String mediaUrl = firstNonBlank(
-                    item.optString("media_url", ""),
-                    item.optJSONObject("payload_json") == null ? "" : item.optJSONObject("payload_json").optString("media_url", ""));
-            String mediaName = firstNonBlank(
-                    item.optString("media_name", ""),
-                    item.optJSONObject("payload_json") == null ? "" : item.optJSONObject("payload_json").optString("media_name", ""));
-            if (isBlank(mediaUrl)) {
-                return SendResult.failed("image media_url is required");
-            }
-            mediaFile = downloadOutboxMedia(config, mediaUrl, mediaName);
-            if (mediaFile == null || !mediaFile.isFile() || mediaFile.length() <= 0) {
-                return SendResult.failed("image media download produced empty file");
-            }
-            SendResult result = sendImage(config, classLoader, wxid, mediaFile, item.optString("text", ""));
-            if (result.ok) {
-                mediaFile = null;
-            }
-            return result;
-        } catch (Throwable t) {
-            return SendResult.failed("image send failed: " + shortError(t));
-        } finally {
-            if (mediaFile != null && mediaFile.isFile() && !mediaFile.delete()) {
-                log("delete outbox image temp file skipped");
-            }
-        }
+        return HookOutboxMediaActionRunner.run(
+                "image",
+                () -> outboxMediaFilePreparer(config).prepare(item, "image", false),
+                media -> sendImage(config, classLoader, wxid, media.file, item.optString("text", "")));
     }
 
     private static SendResult sendVideoAction(BridgeConfig config, ClassLoader classLoader, String wxid, JSONObject item) {
-        File mediaFile = null;
-        try {
-            String mediaUrl = firstNonBlank(
-                    item.optString("media_url", ""),
-                    item.optJSONObject("payload_json") == null ? "" : item.optJSONObject("payload_json").optString("media_url", ""));
-            String mediaName = firstNonBlank(
-                    item.optString("media_name", ""),
-                    item.optJSONObject("payload_json") == null ? "" : item.optJSONObject("payload_json").optString("media_name", ""));
-            if (isBlank(mediaUrl)) {
-                return SendResult.failed("video media_url is required");
-            }
-            mediaFile = downloadOutboxMedia(config, mediaUrl, mediaName);
-            if (mediaFile == null || !mediaFile.isFile() || mediaFile.length() <= 0) {
-                return SendResult.failed("video media download produced empty file");
-            }
-            SendResult result = sendVideo(config, classLoader, wxid, mediaFile);
-            if (result.ok) {
-                mediaFile = null;
-            }
-            return result;
-        } catch (Throwable t) {
-            return SendResult.failed("video send failed: " + shortError(t));
-        } finally {
-            if (mediaFile != null && mediaFile.isFile() && !mediaFile.delete()) {
-                log("delete outbox video temp file skipped");
-            }
-        }
+        return HookOutboxMediaActionRunner.run(
+                "video",
+                () -> outboxMediaFilePreparer(config).prepare(item, "video", false),
+                media -> sendVideo(config, classLoader, wxid, media.file));
     }
 
     private static SendResult sendVoiceAction(BridgeConfig config, ClassLoader classLoader, String wxid, JSONObject item) {
-        File mediaFile = null;
-        try {
-            JSONObject payload = item.optJSONObject("payload_json");
-            String mediaUrl = firstNonBlank(
-                    item.optString("media_url", ""),
-                    payload == null ? "" : payload.optString("media_url", ""));
-            String mediaName = firstNonBlank(
-                    item.optString("media_name", ""),
-                    payload == null ? "" : payload.optString("media_name", ""));
-            int durationMs = firstPositiveInt(
-                    item.optInt("media_duration_ms", 0),
-                    item.optInt("duration_ms", 0),
-                    payload == null ? 0 : payload.optInt("media_duration_ms", 0),
-                    payload == null ? 0 : payload.optInt("duration_ms", 0),
-                    1000);
-            if (isBlank(mediaUrl)) {
-                return SendResult.failed("voice media_url is required");
-            }
-            mediaFile = downloadOutboxMedia(config, mediaUrl, mediaName);
-            if (mediaFile == null || !mediaFile.isFile() || mediaFile.length() <= 0) {
-                return SendResult.failed("voice media download produced empty file");
-            }
-            if (!isSupportedVoiceMedia(mediaFile, mediaName)) {
-                return SendResult.failed("voice media must be AMR or SILK");
-            }
-            SendResult result = sendVoice(config, classLoader, wxid, mediaFile, durationMs);
-            if (result.ok) {
-                mediaFile = null;
-            }
-            return result;
-        } catch (Throwable t) {
-            return SendResult.failed("voice send failed: " + shortError(t));
-        } finally {
-            if (mediaFile != null && mediaFile.isFile() && !mediaFile.delete()) {
-                log("delete outbox voice temp file skipped");
-            }
-        }
+        return HookOutboxMediaActionRunner.run(
+                "voice",
+                () -> outboxMediaFilePreparer(config).prepareVoice(item),
+                media -> sendVoice(config, classLoader, wxid, media.file, media.media.durationMs));
     }
 
     private static SendResult sendFileAction(BridgeConfig config, ClassLoader classLoader, String wxid, JSONObject item) {
-        File mediaFile = null;
-        try {
-            String mediaUrl = firstNonBlank(
-                    item.optString("media_url", ""),
-                    item.optJSONObject("payload_json") == null ? "" : item.optJSONObject("payload_json").optString("media_url", ""));
-            String mediaName = firstNonBlank(
-                    item.optString("media_name", ""),
-                    item.optJSONObject("payload_json") == null ? "" : item.optJSONObject("payload_json").optString("media_name", ""));
-            if (isBlank(mediaUrl)) {
-                return SendResult.failed("file media_url is required");
-            }
-            mediaFile = downloadOutboxMedia(config, mediaUrl, mediaName, true);
-            if (mediaFile == null || !mediaFile.isFile() || mediaFile.length() <= 0) {
-                return SendResult.failed("file media download produced empty file");
-            }
-            SendResult result = sendFile(config, classLoader, wxid, mediaFile);
-            if (result.ok) {
-                mediaFile = null;
-            }
-            return result;
-        } catch (Throwable t) {
-            return SendResult.failed("file send failed: " + shortError(t));
-        } finally {
-            if (mediaFile != null && mediaFile.isFile() && !mediaFile.delete()) {
-                log("delete outbox file temp file skipped");
-            }
-        }
+        return HookOutboxMediaActionRunner.run(
+                "file",
+                () -> outboxMediaFilePreparer(config).prepare(item, "file", true),
+                media -> sendFile(config, classLoader, wxid, media.file));
     }
 
     private static SendResult sendEmojiAction(BridgeConfig config, ClassLoader classLoader, String wxid, JSONObject item) {
@@ -3265,7 +2786,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 if (source.type != 47 && !(source.type == MESSAGE_TYPE_APPMSG && appMsgTypeFromContent(source.content) == 8)) {
                     return SendResult.failed("source_chat_record_id is not an emoji message");
                 }
-                emojiMd5 = emojiMd5FromContent(source.talker, source.content);
+                emojiMd5 = HookMediaServices.emojiMd5FromWechatContent(source.talker, source.content);
             }
             if (isBlank(emojiMd5)) {
                 return SendResult.failed("emoji_md5 or source_chat_record_id is required");
@@ -3534,59 +3055,42 @@ public final class HookEntry implements IXposedHookLoadPackage {
         }
     }
 
-    private static File downloadOutboxMedia(BridgeConfig config, String mediaUrl, String mediaName) throws Exception {
-        return downloadOutboxMedia(config, mediaUrl, mediaName, false);
+    private static SendResult sendRevokeAction(BridgeConfig config, ClassLoader classLoader, String wxid, JSONObject item) {
+        try {
+            JSONObject payload = item.optJSONObject("payload_json");
+            long targetChatRecordId = firstPositiveLong(
+                    item.optLong("target_chat_record_id", 0L),
+                    payload == null ? 0L : payload.optLong("target_chat_record_id", 0L),
+                    payload == null ? 0L : payload.optLong("source_chat_record_id", 0L),
+                    payload == null ? 0L : payload.optLong("client_msg_id", 0L),
+                    payload == null ? 0L : payload.optLong("new_msg_id", 0L));
+            long targetMsgSvrId = firstPositiveLong(
+                    item.optLong("target_msg_svr_id", 0L),
+                    payload == null ? 0L : payload.optLong("target_msg_svr_id", 0L),
+                    payload == null ? 0L : payload.optLong("msg_svr_id", 0L),
+                    payload == null ? 0L : payload.optLong("new_msg_id", 0L));
+            String revokeTicket = firstNonBlank(
+                    item.optString("revoke_ticket", ""),
+                    payload == null ? "" : payload.optString("revoke_ticket", ""));
+            if (targetChatRecordId <= 0L && targetMsgSvrId <= 0L) {
+                return SendResult.failed("target_chat_record_id is required");
+            }
+            return sendRevoke(config, classLoader, wxid, targetChatRecordId, targetMsgSvrId, revokeTicket);
+        } catch (Throwable t) {
+            return SendResult.failed("revoke send failed: " + shortError(t));
+        }
     }
 
-    private static File downloadOutboxMedia(BridgeConfig config, String mediaUrl, String mediaName, boolean preserveName) throws Exception {
-        if (config == null || isBlank(config.baseUrl) || isBlank(config.apiKey)) {
-            throw new IOException("bridge config is missing");
-        }
-        String path = mediaUrl.trim();
-        if (path.startsWith("/api/media/")) {
-            path = "/module/media/" + path.substring("/api/media/".length());
-        }
-        if (!path.startsWith("/module/media/")) {
-            throw new IOException("unsupported media_url");
-        }
-        String separator = path.indexOf('?') >= 0 ? "&" : "?";
-        URL url = new URL(trimRight(config.baseUrl, "/") + path + separator + "api_key=" + urlEncode(config.apiKey));
-        HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-        connection.setConnectTimeout(8000);
-        connection.setReadTimeout(15000);
-        connection.setRequestMethod("GET");
-        connection.setRequestProperty("Connection", "close");
-        int status = connection.getResponseCode();
-        if (status < 200 || status >= 300) {
-            String response = readResponse(connection.getErrorStream());
-            connection.disconnect();
-            throw new IOException("media download HTTP " + status + ": " + response);
-        }
-        File dir = outboxMediaDir();
-        if (!dir.isDirectory() && !dir.mkdirs()) {
-            connection.disconnect();
-            throw new IOException("create outbox media dir failed");
-        }
-        String suffix = preserveName
-                ? "-" + safeCacheFileName(mediaName, path)
-                : safeCacheExtension(mediaName, path);
-        File target = new File(dir, "outbox-" + System.currentTimeMillis() + suffix);
-        long total = 0L;
-        byte[] buffer = new byte[8192];
-        try (InputStream input = connection.getInputStream(); FileOutputStream output = new FileOutputStream(target, false)) {
-            int read;
-            long limit = Math.max(OUTBOX_MEDIA_DOWNLOAD_LIMIT_BYTES, config.mediaUploadLimitBytes);
-            while ((read = input.read(buffer)) != -1) {
-                total += read;
-                if (total > limit) {
-                    throw new IOException("media download exceeds limit");
-                }
-                output.write(buffer, 0, read);
-            }
-        } finally {
-            connection.disconnect();
-        }
-        return target;
+    private static OutboxMediaFilePreparer outboxMediaFilePreparer(BridgeConfig config) {
+        return HookMediaServices.outboxMediaFilePreparer(
+                config,
+                new HookOutboxMediaDownloadEnvironment.CacheDirProvider() {
+                    @Override
+                    public File cacheDir() throws IOException {
+                        return outboxMediaDir();
+                    }
+                },
+                HookEntry::log);
     }
 
     private static File outboxMediaDir() throws IOException {
@@ -3601,171 +3105,6 @@ public final class HookEntry implements IXposedHookLoadPackage {
             throw new IOException("cache dir is not available");
         }
         return new File(context.getCacheDir(), "wechat-observatory-outbox");
-    }
-
-    private static String safeCacheExtension(String mediaName, String mediaUrl) {
-        String value = firstNonBlank(mediaName, mediaUrl).trim().toLowerCase(Locale.US);
-        int query = value.indexOf('?');
-        if (query >= 0) {
-            value = value.substring(0, query);
-        }
-        int dot = value.lastIndexOf('.');
-        if (dot < 0 || dot + 1 >= value.length()) {
-            return ".img";
-        }
-        String ext = value.substring(dot);
-        if (ext.length() > 8) {
-            return ".img";
-        }
-        for (int i = 1; i < ext.length(); i++) {
-            char ch = ext.charAt(i);
-            if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9'))) {
-                return ".img";
-            }
-        }
-        return ext;
-    }
-
-    private static String safeCacheFileName(String mediaName, String mediaUrl) {
-        String value = firstNonBlank(mediaName, mediaUrl).trim();
-        int query = value.indexOf('?');
-        if (query >= 0) {
-            value = value.substring(0, query);
-        }
-        int slash = Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\'));
-        if (slash >= 0 && slash + 1 < value.length()) {
-            value = value.substring(slash + 1);
-        }
-        StringBuilder out = new StringBuilder();
-        for (int i = 0; i < value.length() && out.length() < 80; i++) {
-            char ch = value.charAt(i);
-            if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
-                out.append(ch);
-            } else if (ch == '.' || ch == '_' || ch == '-') {
-                out.append(ch);
-            }
-        }
-        String name = out.toString();
-        if (isBlank(name) || ".".equals(name) || "..".equals(name) || name.startsWith(".")) {
-            String ext = safeCacheExtension(mediaName, mediaUrl);
-            if (".img".equals(ext)) {
-                ext = ".bin";
-            }
-            name = "file" + ext;
-        }
-        return name;
-    }
-
-    private static boolean isSupportedVoiceMedia(File file, String mediaName) {
-        String name = firstNonBlank(mediaName, file == null ? "" : file.getName()).trim().toLowerCase(Locale.US);
-        if (name.endsWith(".amr") || name.endsWith(".silk")) {
-            return true;
-        }
-        if (file == null || !file.isFile()) {
-            return false;
-        }
-        byte[] header = new byte[16];
-        try (FileInputStream input = new FileInputStream(file)) {
-            int read = input.read(header);
-            if (read <= 0) {
-                return false;
-            }
-            String head = new String(header, 0, read, StandardCharsets.US_ASCII);
-            return head.startsWith("#!AMR") || head.startsWith("#!SILK");
-        } catch (Throwable t) {
-            log("voice media header check failed: " + shortError(t));
-            return false;
-        }
-    }
-
-    private static String prepareWeChatVoiceFile(ClassLoader classLoader, String voiceFileName, File source) throws Exception {
-        String audioPath = voiceStoragePath(classLoader, voiceFileName, true);
-        copyFileToWeChatPath(classLoader, source, audioPath);
-        try {
-            String legacyPath = voiceStoragePath(classLoader, voiceFileName, false);
-            if (!isBlank(legacyPath) && !legacyPath.equals(audioPath)) {
-                copyFileToWeChatPath(classLoader, source, legacyPath);
-            }
-        } catch (Throwable t) {
-            log("prepare legacy voice path skipped: " + shortError(t));
-        }
-        return audioPath;
-    }
-
-    private static String voiceStoragePath(ClassLoader classLoader, String voiceFileName, boolean audioScoped) throws Exception {
-        Class<?> storageInterface = findClass(classLoader, "tg3.u0");
-        Object storage = findMethod(findClass(classLoader, "i95.n0"), "c", Class.class).invoke(null, storageInterface);
-        if (storage == null) {
-            throw new IllegalStateException("voice storage service is not available");
-        }
-        Class<?> yClass = findClass(classLoader, "bm5.y");
-        Object voiceResource;
-        if (audioScoped) {
-            Object builder = findField(yClass, "i").get(null);
-            Class<?> oi3Class = findClass(classLoader, "oi3.g");
-            Class<?> f0Class = findClass(classLoader, "bm5.f0");
-            Object audioType = findField(f0Class, "u").get(null);
-            voiceResource = findMethod(builder.getClass(), "d", oi3Class, f0Class).invoke(builder, null, audioType);
-        } else {
-            voiceResource = findField(yClass, "j").get(null);
-        }
-        Method fullPath = findMethod(storage.getClass(), "vj", yClass, String.class, boolean.class);
-        Object path = fullPath.invoke(storage, voiceResource, voiceFileName, true);
-        String value = path == null ? "" : String.valueOf(path);
-        if (isBlank(value)) {
-            throw new IOException("voice storage path is empty");
-        }
-        return value;
-    }
-
-    private static void copyFileToWeChatPath(ClassLoader classLoader, File source, String targetPath) throws Exception {
-        if (source == null || !source.isFile()) {
-            throw new IOException("voice source file is missing");
-        }
-        if (isBlank(targetPath)) {
-            throw new IOException("voice target path is empty");
-        }
-        Throwable vfsFailure = null;
-        try {
-            Class<?> vfsClass = findClass(classLoader, "com.tencent.mm.vfs.w6");
-            Method open = findMethod(vfsClass, "B", String.class, boolean.class);
-            Object raf = open.invoke(null, targetPath, true);
-            if (raf instanceof java.io.RandomAccessFile) {
-                try (java.io.RandomAccessFile output = (java.io.RandomAccessFile) raf;
-                     FileInputStream input = new FileInputStream(source)) {
-                    output.setLength(0L);
-                    byte[] buffer = new byte[8192];
-                    int read;
-                    while ((read = input.read(buffer)) != -1) {
-                        output.write(buffer, 0, read);
-                    }
-                    return;
-                }
-            }
-        } catch (Throwable t) {
-            vfsFailure = t;
-        }
-
-        try {
-            File target = new File(targetPath);
-            File parent = target.getParentFile();
-            if (parent != null && !parent.isDirectory() && !parent.mkdirs()) {
-                throw new IOException("create voice target dir failed");
-            }
-            try (FileInputStream input = new FileInputStream(source);
-                 FileOutputStream output = new FileOutputStream(target, false)) {
-                byte[] buffer = new byte[8192];
-                int read;
-                while ((read = input.read(buffer)) != -1) {
-                    output.write(buffer, 0, read);
-                }
-            }
-        } catch (Throwable fileFailure) {
-            if (vfsFailure != null) {
-                throw new IOException("copy voice file failed via vfs: " + shortError(vfsFailure) + "; file: " + shortError(fileFailure));
-            }
-            throw fileFailure;
-        }
     }
 
     private static SendResult sendImage(BridgeConfig config, ClassLoader classLoader, String wxid, File imageFile, String text) {
@@ -3789,6 +3128,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             return SendResult.failed("image send verification failed before send: " + shortError(t));
         }
+        MEDIA_ATTACHMENT_CONTROLLER.rememberOutgoingSource(targetWxid, 3, targetImageFile, beforeMsgId);
         try {
             callOnMainThread(new Callable<Void>() {
                 @Override
@@ -3803,6 +3143,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
         long msgId = waitForOutgoingImageMessage(config, targetWxid, beforeMsgId, 8000L);
         if (msgId > 0) {
+            MEDIA_ATTACHMENT_CONTROLLER.bindOutgoingSource(targetWxid, 3, msgId, targetImageFile);
             log("sendImage verified outgoing image msgId=" + msgId);
             return SendResult.sent(msgId);
         }
@@ -4286,6 +3627,237 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return pair == null ? 0L : longPairField(pair, "second");
     }
 
+    private static SendResult sendRevoke(
+            BridgeConfig config,
+            ClassLoader classLoader,
+            String wxid,
+            long targetChatRecordId,
+            long targetMsgSvrId,
+            String revokeTicket) {
+        classLoader = runtimeClassLoader(classLoader);
+        if (classLoader == null) {
+            return SendResult.failed("WeChat classLoader is not available");
+        }
+        if (isBlank(wxid)) {
+            return SendResult.failed("wxid is required");
+        }
+        Object db = ensureMessageDatabase(config);
+        if (db == null) {
+            return SendResult.failed("WeChat message database is not available for revoke verification");
+        }
+
+        MessagePayload source = null;
+        long msgSvrId = targetMsgSvrId;
+        try {
+            if (targetChatRecordId > 0L) {
+                source = loadMessagePayloadById(config, db, targetChatRecordId);
+                long resolvedMsgSvrId = messageServerIdByLocalId(db, targetChatRecordId);
+                if (resolvedMsgSvrId > 0L) {
+                    msgSvrId = resolvedMsgSvrId;
+                }
+            }
+        } catch (Throwable t) {
+            return SendResult.failed("revoke source lookup failed: " + shortError(t));
+        }
+        if (source != null && !"sent".equals(source.direction)) {
+            return SendResult.failed("target message is not sent by current account");
+        }
+        String talker = firstNonBlank(source == null ? "" : source.chatId, wxid);
+        if (!sameTalker(talker, wxid)) {
+            return SendResult.failed("target message chat does not match wxid");
+        }
+        final ClassLoader targetClassLoader = classLoader;
+        final String targetTalker = talker;
+        final long localMsgId = targetChatRecordId;
+        final long serverMsgId = msgSvrId;
+        final String ticket = revokeTicket == null ? "" : revokeTicket;
+        final Object message;
+        try {
+            message = loadWechatMessageObject(targetClassLoader, targetTalker, localMsgId, serverMsgId);
+        } catch (Throwable t) {
+            return SendResult.failed("WeChat message object lookup failed: " + shortError(t));
+        }
+        if (message == null) {
+            return SendResult.failed("target message was not found in local WeChat message storage");
+        }
+
+        final long beforeMsgId;
+        try {
+            beforeMsgId = readMaxMessageId(db);
+        } catch (Throwable t) {
+            return SendResult.failed("revoke verification failed before send: " + shortError(t));
+        }
+        try {
+            callOnMainThread(new Callable<Void>() {
+                @Override
+                public Void call() throws Exception {
+                    invokeWeChatRevoke(targetClassLoader, message, ticket);
+                    return null;
+                }
+            });
+        } catch (Throwable t) {
+            return SendResult.failed("WeChat revoke invoke failed: " + shortError(t));
+        }
+
+        long confirmedId = waitForRevokeConfirmation(config, targetTalker, localMsgId, beforeMsgId, 10000L);
+        if (confirmedId > 0L || hasRevokeConfirmed(localMsgId)) {
+            log("sendRevoke verified targetMsgId=" + localMsgId + " revokeRecordId=" + confirmedId);
+            return SendResult.sent(localMsgId);
+        }
+        return SendResult.failed("WeChat revoke invoked but no revoke event was recorded");
+    }
+
+    private static Object loadWechatMessageObject(ClassLoader classLoader, String talker, long msgId, long msgSvrId) throws Exception {
+        Object storage = currentMessageStorage(classLoader);
+        if (storage == null) {
+            return null;
+        }
+        Object message = tryLoadWechatMessageObject(storage, talker, msgId, msgSvrId);
+        if (message != null) {
+            return message;
+        }
+        return scanLoadWechatMessageObject(classLoader, storage, talker, msgId, msgSvrId);
+    }
+
+    private static Object currentMessageStorage(ClassLoader classLoader) throws Exception {
+        Object accountStorage = findNoArgMethod(findClass(classLoader, "c01.d9"), "b").invoke(null);
+        if (accountStorage == null) {
+            return null;
+        }
+        return findNoArgMethod(accountStorage.getClass(), "u").invoke(accountStorage);
+    }
+
+    private static Object tryLoadWechatMessageObject(Object storage, String talker, long msgId, long msgSvrId) {
+        long[] ids = uniquePositiveLongs(msgSvrId, msgId);
+        try {
+            Method byTalkerAndId = findMethod(storage.getClass(), "o2", String.class, long.class);
+            for (long id : ids) {
+                Object message = byTalkerAndId.invoke(storage, talker, id);
+                if (matchesWechatMessageObject(message, talker, msgId, msgSvrId)) {
+                    return message;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Fall through to reflective scan for other storage implementations.
+        }
+        return null;
+    }
+
+    private static Object scanLoadWechatMessageObject(ClassLoader classLoader, Object storage, String talker, long msgId, long msgSvrId) throws Exception {
+        Class<?> messageClass = findClass(classLoader, "com.tencent.mm.storage.f9");
+        List<Method> methods = methodsOf(storage.getClass());
+        long[] ids = uniquePositiveLongs(msgSvrId, msgId);
+        for (Method method : methods) {
+            Class<?>[] types = method.getParameterTypes();
+            if (!messageClass.isAssignableFrom(method.getReturnType())) {
+                continue;
+            }
+            method.setAccessible(true);
+            if (types.length == 2 && types[0] == String.class && isLongParameter(types[1])) {
+                for (long id : ids) {
+                    Object message = method.invoke(storage, talker, Long.valueOf(id));
+                    if (matchesWechatMessageObject(message, talker, msgId, msgSvrId)) {
+                        return message;
+                    }
+                }
+            } else if (types.length == 1 && isLongParameter(types[0])) {
+                for (long id : ids) {
+                    Object message = method.invoke(storage, Long.valueOf(id));
+                    if (matchesWechatMessageObject(message, talker, msgId, msgSvrId)) {
+                        return message;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static List<Method> methodsOf(Class<?> cls) {
+        List<Method> methods = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        Class<?> current = cls;
+        while (current != null) {
+            for (Method method : current.getDeclaredMethods()) {
+                String key = methodKey(method);
+                if (seen.add(key)) {
+                    methods.add(method);
+                }
+            }
+            current = current.getSuperclass();
+        }
+        for (Method method : cls.getMethods()) {
+            String key = methodKey(method);
+            if (seen.add(key)) {
+                methods.add(method);
+            }
+        }
+        return methods;
+    }
+
+    private static String methodKey(Method method) {
+        StringBuilder out = new StringBuilder(method.getName()).append('#').append(method.getParameterTypes().length);
+        for (Class<?> type : method.getParameterTypes()) {
+            out.append(':').append(type.getName());
+        }
+        return out.toString();
+    }
+
+    private static boolean matchesWechatMessageObject(Object message, String talker, long msgId, long msgSvrId) {
+        if (message == null) {
+            return false;
+        }
+        long objectMsgId = firstPositiveLong(
+                optionalLongMethod(message, "getMsgId"),
+                optionalLongField(message, "field_msgId", "msgId"));
+        long objectMsgSvrId = firstPositiveLong(
+                optionalLongMethod(message, "I0"),
+                optionalLongMethod(message, "getMsgSvrId"),
+                optionalLongField(message, "field_msgSvrId", "msgSvrId"));
+        String objectTalker = firstNonBlank(
+                optionalStringMethod(message, "Q0"),
+                optionalStringMethod(message, "getTalker"),
+                optionalStringField(message, "field_talker", "talker"));
+        boolean idMatches = (msgId <= 0L || objectMsgId == msgId)
+                || (msgSvrId > 0L && objectMsgSvrId == msgSvrId);
+        return idMatches && (isBlank(talker) || isBlank(objectTalker) || sameTalker(objectTalker, talker));
+    }
+
+    private static void invokeWeChatRevoke(ClassLoader classLoader, Object message, String revokeTicket) throws Exception {
+        try {
+            Class<?> messageClass = findClass(classLoader, "com.tencent.mm.storage.f9");
+            Class<?> handlerClass = findClass(classLoader, "cd0.b0");
+            Object handler = findFieldAny(handlerClass, "a").get(null);
+            if (handler == null) {
+                handler = handlerClass.getDeclaredConstructor().newInstance();
+            }
+            Method revoke = findMethod(handlerClass, "b", messageClass, String.class, String.class);
+            revoke.invoke(handler, messageClass.cast(message), "", revokeTicket == null ? "" : revokeTicket);
+            log("sendRevoke invoked RevokeMsgHandler");
+            return;
+        } catch (Throwable t) {
+            log("RevokeMsgHandler path failed, try direct NetSceneRevokeMsg: " + shortError(t));
+        }
+        invokeWeChatRevokeScene(classLoader, message, revokeTicket);
+    }
+
+    private static void invokeWeChatRevokeScene(ClassLoader classLoader, Object message, String revokeTicket) throws Exception {
+        Class<?> messageClass = findClass(classLoader, "com.tencent.mm.storage.f9");
+        Class<?> sceneClass = findClass(classLoader, "com.tencent.mm.modelsimple.d1");
+        Object scene = findConstructor(sceneClass, messageClass, String.class, String.class)
+                .newInstance(messageClass.cast(message), "", revokeTicket == null ? "" : revokeTicket);
+        Object queue = findNoArgMethod(findClass(classLoader, "gm0.j1"), "d").invoke(null);
+        try {
+            Class<?> callbackClass = findClass(classLoader, "cd0.t");
+            Object callback = findConstructor(callbackClass, sceneClass).newInstance(scene);
+            findMethod(queue.getClass(), "a", int.class, findClass(classLoader, "com.tencent.mm.modelbase.u0"))
+                    .invoke(queue, Integer.valueOf(594), callback);
+        } catch (Throwable t) {
+            log("revoke scene callback registration skipped: " + shortError(t));
+        }
+        findMethod(queue.getClass(), "g", findClass(classLoader, "com.tencent.mm.modelbase.m1")).invoke(queue, scene);
+        log("sendRevoke invoked NetSceneRevokeMsg directly");
+    }
+
     private static QuoteSource loadQuoteSource(Object db, long quoteMsgId, String quoteTalker) throws Exception {
         QuoteSource source = queryQuoteSource(db, quoteMsgId, quoteTalker, true, true);
         if (source != null) {
@@ -4550,7 +4122,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 r2Class,
                 forwardInfoClass);
         Object element = elementCtor.newInstance(
-                videoFileNamePure(videoFile),
+                HookMediaServices.videoBaseName(videoFile),
                 videoFile.getAbsolutePath(),
                 "",
                 false,
@@ -4587,8 +4159,13 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void sendViaVoiceSendTask(ClassLoader classLoader, String wxid, File voiceFile, int durationMs) throws Exception {
-        String voiceFileName = voiceFileNamePure(voiceFile);
-        String preparedPath = prepareWeChatVoiceFile(classLoader, voiceFileName, voiceFile);
+        String voiceFileName = HookMediaServices.voiceBaseName(voiceFile);
+        String preparedPath = HookWechatVoiceFilePreparer.prepare(
+                classLoader,
+                voiceFileName,
+                voiceFile,
+                WECHAT_VOICE_FILE_REFLECTION,
+                HookEntry::log);
 
         Class<?> paramsClass = findClass(classLoader, "cg0.d");
         Constructor<?> paramsCtor = findConstructor(paramsClass, String.class, String.class);
@@ -4649,106 +4226,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static void logEmojiInfoDiagnostic(String emojiMd5) {
-        String md5 = normalizeEmojiMd5(emojiMd5);
-        if (!looksLikeMd5Hex(md5)) {
-            return;
-        }
-        synchronized (EMOJI_INFO_DIAGNOSTIC_REPORTED_MD5) {
-            if (!EMOJI_INFO_DIAGNOSTIC_REPORTED_MD5.add(md5)) {
-                return;
-            }
-            if (EMOJI_INFO_DIAGNOSTIC_REPORTED_MD5.size() > 80) {
-                EMOJI_INFO_DIAGNOSTIC_REPORTED_MD5.clear();
-                EMOJI_INFO_DIAGNOSTIC_REPORTED_MD5.add(md5);
-            }
-        }
-        try {
-            ClassLoader classLoader = WECHAT_CLASS_LOADER;
-            classLoader = runtimeClassLoader(classLoader == null ? HookEntry.class.getClassLoader() : classLoader);
-            Object emojiInfo = loadEmojiInfoByMd5(classLoader, md5);
-            if (emojiInfo == null) {
-                log("emoji info missing md5=" + shortMd5(md5));
-                return;
-            }
-            log("emoji info found md5=" + shortMd5(md5)
-                    + " class=" + emojiInfo.getClass().getName()
-                    + " fields=" + emojiInfoFieldSummary(emojiInfo));
-        } catch (Throwable t) {
-            log("emoji info diagnostic failed md5=" + shortMd5(md5) + " error=" + shortError(t));
-        }
-    }
-
-    private static String emojiInfoFieldSummary(Object emojiInfo) {
-        if (emojiInfo == null) {
-            return "[]";
-        }
-        StringBuilder out = new StringBuilder("[");
-        Set<String> seen = new HashSet<>();
-        int count = 0;
-        Class<?> current = emojiInfo.getClass();
-        while (current != null && count < 12) {
-            Field[] fields = current.getDeclaredFields();
-            for (Field field : fields) {
-                if (count >= 12) {
-                    break;
-                }
-                if (field == null
-                        || field.getType() != String.class
-                        || Modifier.isStatic(field.getModifiers())
-                        || !seen.add(field.getName())) {
-                    continue;
-                }
-                try {
-                    field.setAccessible(true);
-                    Object value = field.get(emojiInfo);
-                    if (value == null || isBlank(String.valueOf(value))) {
-                        continue;
-                    }
-                    if (count > 0) {
-                        out.append(", ");
-                    }
-                    out.append(field.getName()).append("=").append(summarizeEmojiInfoValue(String.valueOf(value)));
-                    count++;
-                } catch (Throwable ignored) {
-                    // Diagnostics only; skip fields that are not readable on this build.
-                }
-            }
-            current = current.getSuperclass();
-        }
-        if (count == 0) {
-            out.append("no-string-fields");
-        }
-        out.append("]");
-        return out.toString();
-    }
-
-    private static String summarizeEmojiInfoValue(String value) {
-        if (isBlank(value)) {
-            return "";
-        }
-        String trimmed = value.trim();
-        String lower = trimmed.toLowerCase(Locale.US);
-        if (lower.startsWith("http://") || lower.startsWith("https://")) {
-            return "<url>";
-        }
-        if (looksLikeMd5Hex(trimmed)) {
-            return shortMd5(trimmed);
-        }
-        if (trimmed.indexOf('/') >= 0 || trimmed.indexOf(File.separatorChar) >= 0) {
-            return shorten(trimmed, 96);
-        }
-        return shorten(trimmed, 80);
-    }
-
-    private static String shortMd5(String md5) {
-        if (isBlank(md5)) {
-            return "<empty>";
-        }
-        String value = md5.trim();
-        if (value.length() <= 14) {
-            return value;
-        }
-        return value.substring(0, 8) + "..." + value.substring(value.length() - 6);
+        EMOJI_INFO_DIAGNOSTIC_REPORTER.report(emojiMd5);
     }
 
     private static Object loadEmojiInfoByMd5(ClassLoader classLoader, String emojiMd5) throws Exception {
@@ -4848,48 +4326,6 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 boolean.class,
                 boolean.class);
         return ctor.newInstance(null, null, "", null, "", null, false, null, "", null, false, false);
-    }
-
-    private static String videoFileNamePure(File videoFile) {
-        String name = videoFile == null ? "" : videoFile.getName();
-        int dot = name.lastIndexOf('.');
-        if (dot > 0) {
-            name = name.substring(0, dot);
-        }
-        StringBuilder out = new StringBuilder();
-        for (int i = 0; i < name.length(); i++) {
-            char ch = name.charAt(i);
-            if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
-                out.append(ch);
-            } else if (ch == '_' || ch == '-') {
-                out.append(ch);
-            }
-        }
-        if (out.length() == 0) {
-            out.append("outbox_").append(System.currentTimeMillis());
-        }
-        return out.toString();
-    }
-
-    private static String voiceFileNamePure(File voiceFile) {
-        String name = voiceFile == null ? "" : voiceFile.getName();
-        int dot = name.lastIndexOf('.');
-        if (dot > 0) {
-            name = name.substring(0, dot);
-        }
-        StringBuilder out = new StringBuilder();
-        for (int i = 0; i < name.length() && out.length() < 32; i++) {
-            char ch = name.charAt(i);
-            if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9')) {
-                out.append(ch);
-            } else if (ch == '_' || ch == '-') {
-                out.append(ch);
-            }
-        }
-        if (out.length() == 0) {
-            out.append("voice");
-        }
-        return "wo_voice_" + System.currentTimeMillis() + "_" + out;
     }
 
     private static Object ensureMessageDatabase(BridgeConfig config) {
@@ -4999,6 +4435,34 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return 0L;
     }
 
+    private static long waitForOutgoingTextMessage(BridgeConfig config, String wxid, String text, long afterMsgId, long timeoutMs) {
+        long deadline = System.currentTimeMillis() + Math.max(1000L, timeoutMs);
+        Throwable lastError = null;
+        while (System.currentTimeMillis() <= deadline) {
+            try {
+                Object db = ensureMessageDatabase(config);
+                if (db != null) {
+                    long msgId = findOutgoingTextMessageId(db, wxid, text, afterMsgId);
+                    if (msgId > 0) {
+                        return msgId;
+                    }
+                }
+            } catch (Throwable t) {
+                lastError = t;
+            }
+            try {
+                Thread.sleep(250L);
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        if (lastError != null) {
+            log("text send DB verification failed: " + shortError(lastError));
+        }
+        return 0L;
+    }
+
     private static void postVerifiedOutgoingMessage(BridgeConfig config, Object db, long msgId, String kind) {
         if (config == null || db == null || msgId <= 0L) {
             return;
@@ -5010,10 +4474,28 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 return;
             }
             post(config, payload);
-            rememberMediaUpload(payload);
+            MEDIA_RETRY_SCHEDULER.rememberUploaded(payload);
+            scheduleVerifiedOutgoingMediaRetryIfNeeded(config, payload);
         } catch (Throwable t) {
             log("send " + kind + " verified message upload failed msgId=" + msgId + " error=" + shortError(t));
         }
+    }
+
+    private static void scheduleVerifiedOutgoingMediaRetryIfNeeded(BridgeConfig config, MessagePayload payload) {
+        if (payload == null) {
+            return;
+        }
+        MEDIA_RETRY_SCHEDULER.scheduleIfNeeded(
+                config != null && config.mediaUploadEnabled,
+                payload.chatRecordId > 0L ? Long.valueOf(payload.chatRecordId) : null,
+                null,
+                payload.chatId,
+                firstNonBlank(payload.rawXml, payload.text),
+                Integer.valueOf("sent".equals(payload.direction) ? 1 : 0),
+                payload.createTime > 0L ? Long.valueOf(payload.createTime) : null,
+                payload.messageType,
+                "",
+                payload);
     }
 
     private static MessagePayload loadMessagePayloadById(BridgeConfig config, Object db, long msgId) throws Exception {
@@ -5063,10 +4545,285 @@ public final class HookEntry implements IXposedHookLoadPackage {
             }
             int messageType = type <= 0 ? 1 : type;
             Long serverId = msgSvrId > 0L ? Long.valueOf(msgSvrId) : null;
-            String mediaHint = resolveMediaHint(db, messageType, Long.valueOf(msgId), serverId, imgPath);
-            return buildMessagePayload(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), Long.valueOf(msgId), Long.valueOf(createTime), messageType, mediaHint);
+            String mediaHint = MEDIA_ATTACHMENT_CONTROLLER.resolveMediaHint(
+                    db,
+                    messageType,
+                    Long.valueOf(msgId),
+                    serverId,
+                    imgPath);
+            return buildMessagePayload(config, talker, content, isSend == 1 ? Integer.valueOf(1) : Integer.valueOf(0), Long.valueOf(msgId), serverId, Long.valueOf(createTime), messageType, mediaHint);
         } finally {
             closeQuietly(cursor);
+        }
+    }
+
+    private static MessagePayload loadRevokeUpdatePayload(
+            BridgeConfig config,
+            Object db,
+            ContentValues values,
+            Object[] args) throws Exception {
+        Long msgId = positiveLong(contentValueLong(values, "msgId"));
+        if (msgId == null) {
+            msgId = updateLongIdentifier(args, "msgId");
+        }
+        Long msgSvrId = positiveLong(contentValueLong(values, "msgSvrId"));
+        if (msgSvrId == null) {
+            msgSvrId = updateLongIdentifier(args, "msgSvrId");
+        }
+
+        MessagePayload payload = null;
+        if (db != null && msgId != null) {
+            payload = loadRevokeUpdatePayloadByColumn(config, db, "msgId", msgId.longValue(), values);
+        }
+        if (payload == null && db != null && msgSvrId != null) {
+            payload = loadRevokeUpdatePayloadByColumn(config, db, "msgSvrId", msgSvrId.longValue(), values);
+        }
+        if (payload != null) {
+            return payload;
+        }
+        return buildRevokePayloadFromValues(config, values, msgId);
+    }
+
+    private static MessagePayload loadRevokeUpdatePayloadByColumn(
+            BridgeConfig config,
+            Object db,
+            String column,
+            long value,
+            ContentValues values) throws Exception {
+        if (!"msgId".equals(column) && !"msgSvrId".equals(column)) {
+            return null;
+        }
+        Object cursor = rawQuery(db, ""
+                + "SELECT msgId,COALESCE(msgSvrId,0),talker,COALESCE(content,''),isSend,createTime,type,COALESCE(imgPath,'') "
+                + "FROM message "
+                + "WHERE " + column + " = ? AND talker IS NOT NULL AND talker <> '' "
+                + "ORDER BY msgId DESC "
+                + "LIMIT 1", new String[]{String.valueOf(value)});
+        if (cursor == null) {
+            return null;
+        }
+        try {
+            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
+            if (!Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
+                return null;
+            }
+            int columnIndex = 0;
+            long msgId = longColumn(cursor, columnIndex++);
+            long msgSvrId = longColumn(cursor, columnIndex++);
+            String talker = stringColumn(cursor, columnIndex++);
+            String rowContent = stringColumn(cursor, columnIndex++);
+            int isSend = intColumn(cursor, columnIndex++);
+            long createTime = normalizeCreateTime(longColumn(cursor, columnIndex++));
+            int rowType = intColumn(cursor, columnIndex++);
+            String imgPath = stringColumn(cursor, columnIndex);
+
+            String content = firstNonBlank(values.getAsString("content"), rowContent);
+            if (isBlank(talker) || !containsRevokePayload(content)) {
+                return null;
+            }
+            Integer updateType = contentValueInteger(values, "type");
+            int messageType = updateType != null && updateType > 0 ? updateType.intValue() : rowType;
+            if (containsRevokePayload(content) && messageType != 10000) {
+                messageType = 10000;
+            }
+            Long serverId = msgSvrId > 0L ? Long.valueOf(msgSvrId) : null;
+            String mediaHint = MEDIA_ATTACHMENT_CONTROLLER.resolveMediaHint(
+                    db,
+                    messageType,
+                    Long.valueOf(msgId),
+                    serverId,
+                    imgPath);
+            return buildMessagePayload(config, talker, content, Integer.valueOf(isSend == 1 ? 1 : 0), Long.valueOf(msgId), serverId, Long.valueOf(createTime), messageType, mediaHint);
+        } finally {
+            closeQuietly(cursor);
+        }
+    }
+
+    private static MessagePayload buildRevokePayloadFromValues(BridgeConfig config, ContentValues values, Long msgId) {
+        String talker = values.getAsString("talker");
+        String content = values.getAsString("content");
+        if (isBlank(talker) || !containsRevokePayload(content)) {
+            return null;
+        }
+        Integer type = contentValueInteger(values, "type");
+        int messageType = type != null && type > 0 ? type.intValue() : 10000;
+        if (messageType != 10000) {
+            messageType = 10000;
+        }
+        return buildMessagePayload(
+                config,
+                talker,
+                content,
+                contentValueInteger(values, "isSend"),
+                msgId,
+                contentValueLong(values, "msgSvrId"),
+                contentValueLong(values, "createTime"),
+                messageType,
+                values.getAsString("imgPath"));
+    }
+
+    private static void markRevokeUpdatePayload(MessagePayload payload) {
+        if (payload == null) {
+            return;
+        }
+        long recordId = firstPositiveLong(payload.chatRecordId, payload.eventId);
+        if (recordId <= 0L) {
+            return;
+        }
+        payload.id = String.valueOf(recordId) + ":revoke";
+        payload.eventId = recordId;
+        payload.chatRecordId = recordId;
+    }
+
+    private static boolean rememberRevokeUpdate(MessagePayload payload) {
+        long recordId = payload == null ? 0L : firstPositiveLong(payload.chatRecordId, payload.eventId);
+        if (recordId <= 0L) {
+            return true;
+        }
+        synchronized (REVOKE_UPDATE_REPORTED_IDS) {
+            return REVOKE_UPDATE_REPORTED_IDS.add(Long.valueOf(recordId));
+        }
+    }
+
+    private static void rememberRevokeConfirmed(long msgId) {
+        if (msgId <= 0L) {
+            return;
+        }
+        synchronized (REVOKE_CONFIRMED_IDS) {
+            REVOKE_CONFIRMED_IDS.add(Long.valueOf(msgId));
+            if (REVOKE_CONFIRMED_IDS.size() > 1024) {
+                REVOKE_CONFIRMED_IDS.clear();
+                REVOKE_CONFIRMED_IDS.add(Long.valueOf(msgId));
+            }
+        }
+    }
+
+    private static boolean hasRevokeConfirmed(long msgId) {
+        if (msgId <= 0L) {
+            return false;
+        }
+        synchronized (REVOKE_CONFIRMED_IDS) {
+            return REVOKE_CONFIRMED_IDS.contains(Long.valueOf(msgId));
+        }
+    }
+
+    private static Long contentValueLong(ContentValues values, String key) {
+        if (values == null || isBlank(key)) {
+            return null;
+        }
+        try {
+            return values.getAsLong(key);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Integer contentValueInteger(ContentValues values, String key) {
+        if (values == null || isBlank(key)) {
+            return null;
+        }
+        try {
+            return values.getAsInteger(key);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static Long positiveLong(Long value) {
+        if (value == null || value.longValue() <= 0L) {
+            return null;
+        }
+        return value;
+    }
+
+    private static Long updateLongIdentifier(Object[] args, String columnName) {
+        String whereClause = updateWhereClause(args);
+        if (isBlank(whereClause) || isBlank(columnName)) {
+            return null;
+        }
+        String lowerWhere = whereClause.toLowerCase(Locale.US);
+        String lowerColumn = columnName.toLowerCase(Locale.US);
+        if (!lowerWhere.contains(lowerColumn)) {
+            return null;
+        }
+        String[] whereArgs = updateWhereArgs(args);
+        if (whereArgs != null) {
+            for (String arg : whereArgs) {
+                Long value = parsePositiveLong(arg);
+                if (value != null) {
+                    return value;
+                }
+            }
+        }
+        return parsePositiveLongAfterColumn(whereClause, lowerColumn);
+    }
+
+    private static String updateWhereClause(Object[] args) {
+        boolean afterValues = false;
+        if (args == null) {
+            return "";
+        }
+        for (Object arg : args) {
+            if (arg instanceof ContentValues) {
+                afterValues = true;
+                continue;
+            }
+            if (afterValues && arg instanceof String) {
+                return String.valueOf(arg);
+            }
+        }
+        return "";
+    }
+
+    private static String[] updateWhereArgs(Object[] args) {
+        boolean afterValues = false;
+        if (args == null) {
+            return null;
+        }
+        for (Object arg : args) {
+            if (arg instanceof ContentValues) {
+                afterValues = true;
+                continue;
+            }
+            if (afterValues && arg instanceof String[]) {
+                return (String[]) arg;
+            }
+        }
+        return null;
+    }
+
+    private static Long parsePositiveLongAfterColumn(String whereClause, String lowerColumn) {
+        String lowerWhere = whereClause.toLowerCase(Locale.US);
+        int index = lowerWhere.indexOf(lowerColumn);
+        while (index >= 0) {
+            int start = index + lowerColumn.length();
+            while (start < whereClause.length() && !Character.isDigit(whereClause.charAt(start))) {
+                start++;
+            }
+            int end = start;
+            while (end < whereClause.length() && Character.isDigit(whereClause.charAt(end))) {
+                end++;
+            }
+            if (end > start) {
+                Long value = parsePositiveLong(whereClause.substring(start, end));
+                if (value != null) {
+                    return value;
+                }
+            }
+            index = lowerWhere.indexOf(lowerColumn, index + lowerColumn.length());
+        }
+        return null;
+    }
+
+    private static Long parsePositiveLong(String value) {
+        if (isBlank(value)) {
+            return null;
+        }
+        try {
+            long parsed = Long.parseLong(value.trim());
+            return parsed > 0L ? Long.valueOf(parsed) : null;
+        } catch (Throwable ignored) {
+            return null;
         }
     }
 
@@ -5077,6 +4834,27 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 + "WHERE msgId > ? AND talker = ? AND isSend = 1 AND type IN (" + typeFilter + ") "
                 + "ORDER BY msgId DESC "
                 + "LIMIT 1", new String[]{String.valueOf(afterMsgId), wxid});
+        if (cursor == null) {
+            return 0L;
+        }
+        try {
+            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
+            if (Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
+                return longColumn(cursor, 0);
+            }
+            return 0L;
+        } finally {
+            closeQuietly(cursor);
+        }
+    }
+
+    private static long findOutgoingTextMessageId(Object db, String wxid, String text, long afterMsgId) throws Exception {
+        Object cursor = rawQuery(db, ""
+                + "SELECT msgId "
+                + "FROM message "
+                + "WHERE msgId > ? AND talker = ? AND isSend = 1 AND type = 1 AND COALESCE(content,'') = ? "
+                + "ORDER BY msgId DESC "
+                + "LIMIT 1", new String[]{String.valueOf(afterMsgId), wxid, text});
         if (cursor == null) {
             return 0L;
         }
@@ -5102,6 +4880,83 @@ public final class HookEntry implements IXposedHookLoadPackage {
                 wxid,
                 String.valueOf(MESSAGE_TYPE_APPMSG),
                 "%<type>" + appMsgType + "</type>%"});
+        if (cursor == null) {
+            return 0L;
+        }
+        try {
+            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
+            if (Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
+                return longColumn(cursor, 0);
+            }
+            return 0L;
+        } finally {
+            closeQuietly(cursor);
+        }
+    }
+
+    private static long messageServerIdByLocalId(Object db, long msgId) throws Exception {
+        if (db == null || msgId <= 0L) {
+            return 0L;
+        }
+        Object cursor = rawQuery(db, ""
+                + "SELECT COALESCE(msgSvrId,0) "
+                + "FROM message "
+                + "WHERE msgId = ? "
+                + "LIMIT 1", new String[]{String.valueOf(msgId)});
+        if (cursor == null) {
+            return 0L;
+        }
+        try {
+            Method moveToFirst = findNoArgMethod(cursor.getClass(), "moveToFirst");
+            if (Boolean.TRUE.equals(moveToFirst.invoke(cursor))) {
+                return longColumn(cursor, 0);
+            }
+            return 0L;
+        } finally {
+            closeQuietly(cursor);
+        }
+    }
+
+    private static long waitForRevokeConfirmation(
+            BridgeConfig config,
+            String talker,
+            long targetMsgId,
+            long afterMsgId,
+            long timeoutMs) {
+        long deadline = System.currentTimeMillis() + Math.max(1000L, timeoutMs);
+        while (System.currentTimeMillis() < deadline) {
+            if (hasRevokeConfirmed(targetMsgId)) {
+                return targetMsgId;
+            }
+            Object db = ensureMessageDatabase(config);
+            if (db != null) {
+                try {
+                    long revokeMsgId = findRevokeSystemMessageId(db, talker, afterMsgId);
+                    if (revokeMsgId > 0L) {
+                        return revokeMsgId;
+                    }
+                } catch (Throwable t) {
+                    log("revoke confirmation lookup failed: " + shortError(t));
+                }
+            }
+            try {
+                Thread.sleep(350L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return 0L;
+            }
+        }
+        return 0L;
+    }
+
+    private static long findRevokeSystemMessageId(Object db, String talker, long afterMsgId) throws Exception {
+        Object cursor = rawQuery(db, ""
+                + "SELECT msgId "
+                + "FROM message "
+                + "WHERE msgId > ? AND talker = ? AND type = 10000 "
+                + "AND (COALESCE(content,'') LIKE '%revokemsg%' OR COALESCE(content,'') LIKE '%撤回%') "
+                + "ORDER BY msgId DESC "
+                + "LIMIT 1", new String[]{String.valueOf(afterMsgId), talker});
         if (cursor == null) {
             return 0L;
         }
@@ -5371,6 +5226,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return value;
     }
 
+    private static String cdataSafe(String value) {
+        return (value == null ? "" : value).replace("]]>", "]]]]><![CDATA[>");
+    }
+
     private static void verifyWebSocketHandshake(InputStream input, String key) throws Exception {
         String headers = readHttpHeaders(input);
         String[] lines = headers.split("\r\n");
@@ -5539,23 +5398,7 @@ public final class HookEntry implements IXposedHookLoadPackage {
         log(message);
     }
 
-    private static SendResult sendText(ClassLoader classLoader, String wxid, String text) {
-        final ClassLoader targetClassLoader = classLoader;
-        final String targetWxid = wxid;
-        final String targetText = text;
-        try {
-            return callOnMainThread(new Callable<SendResult>() {
-                @Override
-                public SendResult call() {
-                    return sendTextOnWeChatThread(targetClassLoader, targetWxid, targetText);
-                }
-            });
-        } catch (Throwable t) {
-            return SendResult.failed("WeChat send failed on main thread: " + shortError(t));
-        }
-    }
-
-    private static SendResult sendTextOnWeChatThread(ClassLoader classLoader, String wxid, String text) {
+    private static SendResult sendText(BridgeConfig config, ClassLoader classLoader, String wxid, String text) {
         classLoader = runtimeClassLoader(classLoader);
         if (classLoader == null) {
             return SendResult.failed("WeChat classLoader is not available");
@@ -5564,62 +5407,122 @@ public final class HookEntry implements IXposedHookLoadPackage {
             return SendResult.failed("wxid and text are required");
         }
 
-        int msgType = resolveMessageType(classLoader, wxid);
-        Throwable builderUnavailable = null;
-        Throwable directUnavailable = null;
-        Throwable eventUnavailable = null;
-        try {
-            boolean sent = sendViaSendBuilder(classLoader, wxid, text, msgType);
-            if (!sent) {
-                return SendResult.failed("WeChat send builder returned false");
-            }
-            log("sendText sent via w11.r1 builder wxid=" + wxid + " msgType=" + msgType);
-            return SendResult.sent(0L);
-        } catch (ClassNotFoundException | NoSuchMethodException e) {
-            builderUnavailable = e;
-            log("w11.r1 builder path unavailable, trying dk5.s5.fj: " + shortError(e));
-        } catch (Throwable t) {
-            return SendResult.failed("WeChat send failed via w11.r1 builder: " + shortError(t));
+        Object db = ensureMessageDatabase(config);
+        if (db == null) {
+            return SendResult.failed("WeChat message database is not available for text send verification");
         }
 
-        try {
-            long msgId = sendViaNetScene(classLoader, wxid, text, msgType);
-            log("sendText sent via w11.r0 NetScene wxid=" + wxid + " msgType=" + msgType + " msgId=" + msgId);
+        synchronized (WECHAT_SEND_LOCK) {
+            final ClassLoader targetClassLoader = classLoader;
+            final String targetWxid = wxid;
+            final String targetText = text;
+            final int msgType = resolveMessageType(classLoader, wxid);
+            final long beforeMsgId;
+            try {
+                beforeMsgId = readMaxMessageId(db);
+            } catch (Throwable t) {
+                return SendResult.failed("text send verification failed before send: " + shortError(t));
+            }
+            Throwable directUnavailable = null;
+            Throwable builderUnavailable = null;
+            Throwable eventUnavailable = null;
+            try {
+                Boolean sent = callOnMainThread(new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() throws Exception {
+                        return Boolean.valueOf(sendViaSendBuilder(targetClassLoader, targetWxid, targetText, msgType));
+                    }
+                });
+                if (Boolean.TRUE.equals(sent)) {
+                    return verifyOutgoingTextSend(config, targetWxid, targetText, beforeMsgId, "w11.r1 builder", msgType);
+                }
+                builderUnavailable = new IllegalStateException("WeChat send builder returned false");
+                long builderFalseMsgId = waitForOutgoingTextMessage(config, targetWxid, targetText, beforeMsgId, 1500L);
+                if (builderFalseMsgId > 0L) {
+                    log("sendText verified outgoing text despite w11.r1 builder=false wxid="
+                            + redactedId(wxid) + " msgType=" + msgType + " msgId=" + builderFalseMsgId);
+                    return SendResult.sent(builderFalseMsgId);
+                }
+                log("w11.r1 builder returned false without outgoing row, trying SendMsgEvent");
+            } catch (ClassNotFoundException | NoSuchMethodException e) {
+                builderUnavailable = e;
+                log("w11.r1 builder path unavailable, trying SendMsgEvent: " + shortError(e));
+            } catch (Throwable t) {
+                return SendResult.failed("WeChat send failed via w11.r1 builder: " + shortError(t));
+            }
+
+            try {
+                Boolean published = callOnMainThread(new Callable<Boolean>() {
+                    @Override
+                    public Boolean call() throws Exception {
+                        return Boolean.valueOf(sendViaSendMsgEvent(targetClassLoader, targetWxid, targetText, msgType));
+                    }
+                });
+                if (!Boolean.TRUE.equals(published)) {
+                    throw new IllegalStateException("SendMsgEvent had no listener");
+                }
+                return verifyOutgoingTextSend(config, targetWxid, targetText, beforeMsgId, "SendMsgEvent", msgType);
+            } catch (ClassNotFoundException | NoSuchMethodException e) {
+                eventUnavailable = e;
+                log("SendMsgEvent path unavailable, trying dk5.s5.fj: " + shortError(e));
+            } catch (Throwable t) {
+                return SendResult.failed("WeChat send failed via SendMsgEvent: "
+                        + shortError(t)
+                        + "; builder unavailable: " + shortError(builderUnavailable));
+            }
+
+            try {
+                callOnMainThread(new Callable<Void>() {
+                    @Override
+                    public Void call() throws Exception {
+                        sendViaSendMsgMgr(targetClassLoader, targetWxid, targetText, msgType);
+                        return null;
+                    }
+                });
+                return verifyOutgoingTextSend(config, targetWxid, targetText, beforeMsgId, "dk5.s5.fj", msgType);
+            } catch (ClassNotFoundException | NoSuchMethodException e) {
+                directUnavailable = e;
+                log("dk5.s5.fj path unavailable, trying legacy w11.r0 NetScene: " + shortError(e));
+            } catch (Throwable t) {
+                return SendResult.failed("WeChat send failed via dk5.s5.fj: "
+                        + shortError(t)
+                        + "; event unavailable: " + shortError(eventUnavailable)
+                        + "; builder unavailable: " + shortError(builderUnavailable));
+            }
+
+            try {
+                Long msgId = callOnMainThread(new Callable<Long>() {
+                    @Override
+                    public Long call() throws Exception {
+                        return Long.valueOf(sendViaNetScene(targetClassLoader, targetWxid, targetText, msgType));
+                    }
+                });
+                long fallbackMsgId = msgId == null ? 0L : msgId.longValue();
+                return verifyOutgoingTextSend(config, targetWxid, targetText, beforeMsgId, "legacy w11.r0 NetScene", msgType, fallbackMsgId);
+            } catch (Throwable t) {
+                return SendResult.failed("WeChat send failed via legacy w11.r0 NetScene: "
+                        + shortError(t)
+                        + "; event unavailable: " + shortError(eventUnavailable)
+                        + "; manager unavailable: " + shortError(directUnavailable)
+                        + "; builder unavailable: " + shortError(builderUnavailable));
+            }
+        }
+    }
+
+    private static SendResult verifyOutgoingTextSend(BridgeConfig config, String wxid, String text, long beforeMsgId, String path, int msgType) {
+        return verifyOutgoingTextSend(config, wxid, text, beforeMsgId, path, msgType, 0L);
+    }
+
+    private static SendResult verifyOutgoingTextSend(BridgeConfig config, String wxid, String text, long beforeMsgId, String path, int msgType, long fallbackMsgId) {
+        long msgId = waitForOutgoingTextMessage(config, wxid, text, beforeMsgId, 8000L);
+        if (msgId > 0L) {
+            log("sendText verified outgoing text via " + path + " wxid=" + redactedId(wxid) + " msgType=" + msgType + " msgId=" + msgId);
             return SendResult.sent(msgId);
-        } catch (ClassNotFoundException | NoSuchMethodException e) {
-            directUnavailable = e;
-            log("w11.r0 NetScene path unavailable, trying dk5.s5.fj: " + shortError(e));
-        } catch (Throwable t) {
-            directUnavailable = t;
-            log("w11.r0 NetScene send failed, trying dk5.s5.fj: " + shortError(t));
         }
-
-        try {
-            boolean published = sendViaSendMsgEvent(classLoader, wxid, text, msgType);
-            if (!published) {
-                throw new IllegalStateException("SendMsgEvent had no listener");
-            }
-            log("sendText published SendMsgEvent wxid=" + wxid + " msgType=" + msgType);
-            return SendResult.sent(0L);
-        } catch (ClassNotFoundException | NoSuchMethodException e) {
-            eventUnavailable = e;
-            log("SendMsgEvent path unavailable, trying dk5.s5.fj: " + shortError(e));
-        } catch (Throwable t) {
-            eventUnavailable = t;
-            log("SendMsgEvent send failed, trying dk5.s5.fj: " + shortError(t));
+        if (fallbackMsgId > 0L) {
+            log("sendText legacy path returned msgId=" + fallbackMsgId + " but verification did not observe matching text row");
         }
-
-        try {
-            sendViaSendMsgMgr(classLoader, wxid, text, msgType);
-            log("sendText sent via dk5.s5.fj wxid=" + wxid + " msgType=" + msgType);
-            return SendResult.sent(0L);
-        } catch (Throwable t) {
-            return SendResult.failed("WeChat send failed via dk5.s5.fj fallback: "
-                    + shortError(t)
-                    + "; event unavailable: " + shortError(eventUnavailable)
-                    + "; direct unavailable: " + shortError(directUnavailable)
-                    + "; builder unavailable: " + shortError(builderUnavailable));
-        }
+        return SendResult.failed("WeChat text send via " + path + " invoked but no outgoing text message was recorded");
     }
 
     private static boolean sendViaSendMsgEvent(ClassLoader classLoader, String wxid, String text, int msgType) throws Exception {
@@ -5637,12 +5540,14 @@ public final class HookEntry implements IXposedHookLoadPackage {
     }
 
     private static <T> T callOnMainThread(Callable<T> callable) throws Exception {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            return callable.call();
+        synchronized (WECHAT_SEND_LOCK) {
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                return callable.call();
+            }
+            FutureTask<T> task = new FutureTask<>(callable);
+            new Handler(Looper.getMainLooper()).post(task);
+            return task.get();
         }
-        FutureTask<T> task = new FutureTask<>(callable);
-        new Handler(Looper.getMainLooper()).post(task);
-        return task.get();
     }
 
     private static long sendViaNetScene(ClassLoader classLoader, String wxid, String text, int msgType) throws Exception {
@@ -5900,6 +5805,61 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return Long.parseLong(String.valueOf(value));
     }
 
+    private static long optionalLongField(Object target, String... names) {
+        if (target == null) {
+            return 0L;
+        }
+        try {
+            return getLongField(target, names);
+        } catch (Throwable ignored) {
+            return 0L;
+        }
+    }
+
+    private static String optionalStringField(Object target, String... names) {
+        Object value = optionalObjectField(target, names);
+        return value == null ? "" : String.valueOf(value);
+    }
+
+    private static Object optionalObjectField(Object target, String... names) {
+        if (target == null) {
+            return null;
+        }
+        try {
+            Field field = findFieldAny(target.getClass(), names);
+            return field.get(target);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static long optionalLongMethod(Object target, String name) {
+        if (target == null || isBlank(name)) {
+            return 0L;
+        }
+        try {
+            Object value = findNoArgMethod(target.getClass(), name).invoke(target);
+            if (value instanceof Number) {
+                return ((Number) value).longValue();
+            }
+            return value == null ? 0L : Long.parseLong(String.valueOf(value));
+        } catch (Throwable ignored) {
+            return 0L;
+        }
+    }
+
+    private static String optionalStringMethod(Object target, String name) {
+        if (target == null || isBlank(name)) {
+            return "";
+        }
+        try {
+            Object value = findNoArgMethod(target.getClass(), name).invoke(target);
+            return value == null ? "" : String.valueOf(value);
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     private static String joinNames(String... names) {
         StringBuilder out = new StringBuilder();
         for (String name : names) {
@@ -5984,8 +5944,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
         ByteArrayOutputStream response = new ByteArrayOutputStream();
         try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress(host, port), 5000);
-            socket.setSoTimeout(5000);
+            socket.connect(new InetSocketAddress(host, port), BRIDGE_CONNECT_TIMEOUT_MS);
+            socket.setSoTimeout(BRIDGE_READ_TIMEOUT_MS);
             OutputStream out = socket.getOutputStream();
             out.write(headers.toString().getBytes(StandardCharsets.ISO_8859_1));
             out.write(body);
@@ -6065,8 +6025,8 @@ public final class HookEntry implements IXposedHookLoadPackage {
     private static String postJsonOnce(BridgeConfig config, String path, String bodyJson) throws Exception {
         URL url = new URL(trimRight(config.baseUrl, "/") + path);
         HttpURLConnection connection = (HttpURLConnection) url.openConnection();
-        connection.setConnectTimeout(5000);
-        connection.setReadTimeout(5000);
+        connection.setConnectTimeout(BRIDGE_CONNECT_TIMEOUT_MS);
+        connection.setReadTimeout(BRIDGE_READ_TIMEOUT_MS);
         connection.setRequestMethod("POST");
         connection.setDoOutput(true);
         connection.setRequestProperty("Content-Type", "application/json; charset=utf-8");
@@ -6108,6 +6068,25 @@ public final class HookEntry implements IXposedHookLoadPackage {
         return String.valueOf(args[index]);
     }
 
+    private static ContentValues contentValuesArg(Object[] args) {
+        if (args == null) {
+            return null;
+        }
+        for (Object arg : args) {
+            if (arg instanceof ContentValues) {
+                return (ContentValues) arg;
+            }
+        }
+        return null;
+    }
+
+    private static int affectedRows(Object result) {
+        if (result instanceof Number) {
+            return ((Number) result).intValue();
+        }
+        return 0;
+    }
+
     private static long normalizeCreateTime(Long createTime) {
         return normalizeCreateTime(createTime == null ? 0L : createTime.longValue());
     }
@@ -6121,6 +6100,10 @@ public final class HookEntry implements IXposedHookLoadPackage {
 
     private static void log(String message) {
         BridgeLogger.log(message);
+    }
+
+    private static String redactedId(String value) {
+        return isBlank(value) ? "<empty>" : "<set>";
     }
 
 }

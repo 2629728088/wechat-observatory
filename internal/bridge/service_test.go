@@ -479,6 +479,56 @@ func TestAdminSendVideoActionStoresMediaAndQueuesAction(t *testing.T) {
 	}
 }
 
+func TestAckOutboxSuppressesLiveDuplicateWhenObservedMessageAlreadyStored(t *testing.T) {
+	persistence := &fakePersistence{}
+	service := newTestService("", WithPersistence(persistence))
+
+	outboxID, err := service.SendAction(t.Context(), SendActionRequest{
+		Device:    "phone-a",
+		OwnerWxID: "wxid_self",
+		WxIDs:     []string{"wxid_friend"},
+		Kind:      OutboxKindText,
+		Text:      "already observed before ack",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := pollOutbox(t, service, "phone-a", 10)
+	if len(items) != 1 || items[0].ID != outboxID {
+		t.Fatalf("expected one outbox item, got %+v", items)
+	}
+	persistence.existingEventKeys = map[string]bool{
+		fakeMessageEventKey(MessageEvent{
+			Device:       "phone-a",
+			OwnerWxID:    "wxid_self",
+			Direction:    DirectionSent,
+			ChatRecordID: 4321,
+		}): true,
+	}
+
+	acked, err := service.AckOutbox(t.Context(), ModuleAckRequest{
+		APIKey: testAPIKey,
+		Device: "phone-a",
+		Items: []ModuleAckItem{{
+			ID:           items[0].ID,
+			Status:       "sent",
+			ChatRecordID: 4321,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acked) != 1 {
+		t.Fatalf("expected one acked item, got %+v", acked)
+	}
+	if len(persistence.outboundEvents) != 1 {
+		t.Fatalf("ack should still update persistence, got %+v", persistence.outboundEvents)
+	}
+	if got := service.Hub().Recent(1); len(got) != 0 {
+		t.Fatalf("duplicate ack event should not hit live hub: %+v", got)
+	}
+}
+
 func TestAdminSendVoiceActionStoresMediaAndQueuesAction(t *testing.T) {
 	mediaDir := t.TempDir()
 	service := newTestService("", WithMediaDir(mediaDir))
@@ -1168,6 +1218,70 @@ func TestAdminSendChatHistoryActionQueuesOriginalForwardSource(t *testing.T) {
 	}
 }
 
+func TestAdminSendRevokeActionQueuesTargetAndPublishesSystemAck(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	body := []byte(`{
+		"device":"phone-a",
+		"owner_wxid":"wxid_self",
+		"wx_ids":["wxid_friend"],
+		"kind":"revoke",
+		"target_chat_record_id":8208,
+		"target_msg_svr_id":9100001
+	}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/send/action", bytes.NewReader(body))
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
+	}
+	items := pollOutbox(t, service, "phone-a", 10)
+	if len(items) != 1 {
+		t.Fatalf("expected one outbox item, got %+v", items)
+	}
+	item := items[0]
+	var payload struct {
+		TargetChatRecordID int64 `json:"target_chat_record_id"`
+		TargetMsgSvrID     int64 `json:"target_msg_svr_id"`
+	}
+	if err := json.Unmarshal(item.PayloadJSON, &payload); err != nil {
+		t.Fatalf("payload_json should be valid json: %v", err)
+	}
+	if item.Kind != OutboxKindRevoke || item.Text != "[撤回]" || payload.TargetChatRecordID != 8208 || payload.TargetMsgSvrID != 9100001 {
+		t.Fatalf("unexpected revoke action: item=%+v payload=%+v", item, payload)
+	}
+
+	acked, err := service.AckOutbox(t.Context(), ModuleAckRequest{
+		APIKey: testAPIKey,
+		Device: "phone-a",
+		Items: []ModuleAckItem{{
+			ID:           item.ID,
+			Status:       "sent",
+			ChatRecordID: 8208,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(acked) != 1 {
+		t.Fatalf("expected one acked item, got %+v", acked)
+	}
+	events := service.Hub().Recent(1)
+	if len(events) != 1 {
+		t.Fatalf("expected one outbound revoke event, got %+v", events)
+	}
+	event := events[0]
+	if event.MessageType != 10000 || event.MessageKind != MessageKindSystem || event.AppMsgSubtype != SystemSubtypeRevoke {
+		t.Fatalf("unexpected outbound revoke event: %+v", event)
+	}
+	if event.ChatRecordID == 8208 || event.AppMsgFileName != "8208" || event.AppMsgAppName != "9100001" || event.AppMsgURL != "wxid_friend" {
+		t.Fatalf("revoke ack should preserve target identifiers without reusing them as event id: %+v", event)
+	}
+}
+
 func TestModuleMediaFileRequiresAPIKeyAndDeviceScopedPath(t *testing.T) {
 	mediaDir := t.TempDir()
 	service := newTestService("", WithMediaDir(mediaDir))
@@ -1398,6 +1512,121 @@ func TestIngestRecordsPersistenceChain(t *testing.T) {
 	}
 	if len(outbox.items) != 0 {
 		t.Fatalf("pure gateway ingest should not enqueue replies: %+v", outbox.items)
+	}
+}
+
+func TestIngestPublishesMediaEnrichmentForExistingMessage(t *testing.T) {
+	persistence := &fakePersistence{
+		existingEventKeys: map[string]bool{
+			fakeMessageEventKey(MessageEvent{
+				Device:       "phone-a",
+				OwnerWxID:    "wxid_self",
+				Direction:    DirectionRecv,
+				ChatRecordID: 5678,
+			}): true,
+		},
+	}
+	service := newTestService("", WithPersistence(persistence))
+
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey:       testAPIKey,
+		ID:           "5678",
+		Device:       "phone-a",
+		From:         "wxid_friend",
+		To:           "wxid_self",
+		Text:         "[图片]",
+		Direction:    DirectionRecv,
+		ChatRecordID: 5678,
+		MessageType:  3,
+		MediaKind:    "image",
+		MediaMime:    "image/jpeg",
+		MediaName:    "late.jpg",
+		MediaURL:     "/api/media/phone-a/20260706/late.jpg",
+		MediaSize:    3778,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || !result.Published || result.PersistenceError != "" {
+		t.Fatalf("media enrichment should publish once: %+v", result)
+	}
+	got := service.Hub().Recent(1)
+	if len(got) != 1 || got[0].MediaURL == "" || got[0].ChatRecordID != 5678 {
+		t.Fatalf("media enrichment should hit live hub: %+v", got)
+	}
+}
+
+func TestIngestSuppressesMediaDuplicateWhenExistingMessageAlreadyHasMedia(t *testing.T) {
+	existing := MessageEvent{
+		Device:       "phone-a",
+		OwnerWxID:    "wxid_self",
+		Direction:    DirectionRecv,
+		ChatRecordID: 6789,
+	}
+	persistence := &fakePersistence{
+		existingEventKeys: map[string]bool{fakeMessageEventKey(existing): true},
+		existingMediaKeys: map[string]bool{fakeMessageEventKey(existing): true},
+	}
+	service := newTestService("", WithPersistence(persistence))
+
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey:       testAPIKey,
+		ID:           "6789",
+		Device:       "phone-a",
+		From:         "wxid_friend",
+		To:           "wxid_self",
+		Text:         "[图片]",
+		Direction:    DirectionRecv,
+		ChatRecordID: 6789,
+		MessageType:  3,
+		MediaKind:    "image",
+		MediaURL:     "/api/media/phone-a/20260706/already.jpg",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Published || result.PersistenceError != "" {
+		t.Fatalf("existing media duplicate should stay suppressed: %+v", result)
+	}
+	if got := service.Hub().Recent(1); len(got) != 0 {
+		t.Fatalf("existing media duplicate should not hit live hub: %+v", got)
+	}
+}
+
+func TestIngestSuppressesLiveDuplicateWhenPersistenceAlreadyHasMessage(t *testing.T) {
+	persistence := &fakePersistence{
+		existingEventKeys: map[string]bool{
+			fakeMessageEventKey(MessageEvent{
+				Device:       "phone-a",
+				OwnerWxID:    "wxid_self",
+				Direction:    DirectionSent,
+				ChatRecordID: 4321,
+			}): true,
+		},
+	}
+	service := newTestService("", WithPersistence(persistence))
+
+	result, err := service.Ingest(t.Context(), MessageEvent{
+		APIKey:       testAPIKey,
+		ID:           "4321",
+		Device:       "phone-a",
+		From:         "wxid_self",
+		To:           "wxid_friend",
+		Text:         "outbound observed after ack",
+		Direction:    DirectionSent,
+		ChatRecordID: 4321,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Published || result.PersistenceError != "" {
+		t.Fatalf("duplicate ingest should be persisted but not republished: %+v", result)
+	}
+	if len(persistence.inboundEvents) != 1 {
+		t.Fatalf("duplicate event should still update persistence, got %+v", persistence.inboundEvents)
+	}
+	if got := service.Hub().Recent(1); len(got) != 0 {
+		t.Fatalf("duplicate event should not hit live hub: %+v", got)
 	}
 }
 
@@ -1704,7 +1933,7 @@ func TestModuleOutboxWebSocketPushAndAck(t *testing.T) {
 	}
 }
 
-func TestModuleOutboxPollIsSerializedForWeChatSender(t *testing.T) {
+func TestModuleOutboxPollBatchesPendingItems(t *testing.T) {
 	service := newTestService("")
 	for _, text := range []string{"first queued reply", "second queued reply"} {
 		if _, err := service.SendText(t.Context(), SendTextRequest{
@@ -1724,8 +1953,8 @@ func TestModuleOutboxPollIsSerializedForWeChatSender(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) != 1 || items[0].Text != "first queued reply" {
-		t.Fatalf("unexpected serialized poll items: %+v", items)
+	if len(items) != 2 || items[0].Text != "first queued reply" || items[1].Text != "second queued reply" {
+		t.Fatalf("unexpected batched poll items: %+v", items)
 	}
 }
 
@@ -1791,15 +2020,17 @@ func newTestService(legacyEndpoint string, opts ...Option) *Service {
 }
 
 type fakePersistence struct {
-	deviceName       string
-	deviceWxID       string
-	deviceNickname   string
-	deviceByWxID     map[string]config.Device
-	inboundEvents    []MessageEvent
-	outboundEvents   []MessageEvent
-	moduleActivities []ModuleActivity
-	contactSnapshots []ModuleContactSnapshotRequest
-	calls            []string
+	deviceName        string
+	deviceWxID        string
+	deviceNickname    string
+	deviceByWxID      map[string]config.Device
+	existingEventKeys map[string]bool
+	existingMediaKeys map[string]bool
+	inboundEvents     []MessageEvent
+	outboundEvents    []MessageEvent
+	moduleActivities  []ModuleActivity
+	contactSnapshots  []ModuleContactSnapshotRequest
+	calls             []string
 }
 
 func (p *fakePersistence) UpdateDeviceIdentity(_ context.Context, deviceName string, wxid string, nickname string) error {
@@ -1842,6 +2073,29 @@ func (p *fakePersistence) RecordOutboundEvent(_ context.Context, event MessageEv
 	p.calls = append(p.calls, "outbound")
 	p.outboundEvents = append(p.outboundEvents, event)
 	return nil
+}
+
+func (p *fakePersistence) HasMessageEvent(_ context.Context, event MessageEvent) (bool, error) {
+	if p.existingEventKeys == nil {
+		return false, nil
+	}
+	return p.existingEventKeys[fakeMessageEventKey(event)], nil
+}
+
+func (p *fakePersistence) HasMessageEventMedia(_ context.Context, event MessageEvent) (bool, error) {
+	if p.existingMediaKeys == nil {
+		return false, nil
+	}
+	return p.existingMediaKeys[fakeMessageEventKey(event)], nil
+}
+
+func fakeMessageEventKey(event MessageEvent) string {
+	return strings.Join([]string{
+		strings.TrimSpace(event.Device),
+		strings.TrimSpace(event.OwnerWxID),
+		string(event.Direction),
+		strconv.FormatInt(event.ChatRecordID, 10),
+	}, "\x00")
 }
 
 func (p *fakePersistence) RecordModuleActivity(_ context.Context, activity ModuleActivity) error {

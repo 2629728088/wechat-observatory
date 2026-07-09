@@ -9,6 +9,7 @@
     <string name="label_api_key">API Key</string>
     <string name="label_poll_interval">出站轮询间隔毫秒</string>
     <string name="label_poll_limit">单次拉取数量</string>
+    <string name="label_outbox_parallelism">出站并发数</string>
     <string name="label_contact_sync_interval">通讯录同步间隔毫秒</string>
     <string name="label_contact_sync_limit">通讯录同步上限</string>
     <string name="label_contact_include_chatrooms">是否同步群聊 0/1</string>

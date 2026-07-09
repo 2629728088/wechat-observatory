@@ -9,7 +9,7 @@
 - [ ] 确认 `.env`、真实 k3s secret、真实 Docker env 没有提交。
 - [ ] 确认 README 可以让新用户跑起服务端、Web 和 Android 模块。
 - [ ] 确认 README 标注当前适配微信 Android `8.0.75`。
-- [ ] 建议补充 Gradle Wrapper，方便用户命令行构建 Android 模块。
+- [x] 已补充 Gradle Wrapper，用户可命令行构建 Android 模块。
 - [ ] 确认文档说明 Root、LSPosed、微信 Hook 和账号风险。
 - [ ] 确认仓库不包含真实聊天截图、真实日志、真实数据库导出。
 
@@ -25,7 +25,7 @@ cd android-module
 cd ..
 ```
 
-如果仓库没有 `android-module/gradlew.bat`，请改用 Android Studio 构建，或先添加 Gradle Wrapper 后再运行命令行验证。
+macOS/Linux 使用 `./gradlew :app:assembleDebug`。Android Studio 仍可用于打开 `android-module` 并构建同一个 debug 变体。
 
 敏感信息扫描：
 

@@ -30,6 +30,7 @@ const (
 	OutboxKindLocation = "location"
 	OutboxKindQuote    = "quote"
 	OutboxKindLink     = "link"
+	OutboxKindRevoke   = "revoke"
 
 	OutboxKindChatHistory = "chat_history"
 	OutboxKindMiniProgram = "mini_program"
@@ -211,6 +212,9 @@ type SendActionRequest struct {
 	ForwardOriginal     bool     `json:"forward_original,omitempty"`
 	SourceChatRecordID  int64    `json:"source_chat_record_id,omitempty"`
 	SourceChatRecordIDs []int64  `json:"source_chat_record_ids,omitempty"`
+	TargetChatRecordID  int64    `json:"target_chat_record_id,omitempty"`
+	TargetMsgSvrID      int64    `json:"target_msg_svr_id,omitempty"`
+	RevokeTicket        string   `json:"revoke_ticket,omitempty"`
 	LocationLatitude    *float64 `json:"location_latitude,omitempty"`
 	LocationLongitude   *float64 `json:"location_longitude,omitempty"`
 	LocationScale       int      `json:"location_scale,omitempty"`
@@ -266,6 +270,7 @@ func (req SendActionRequest) Validate(defaultDevice string) (SendActionRequest, 
 	req.RecordTitle = strings.TrimSpace(req.RecordTitle)
 	req.RecordDescription = strings.TrimSpace(req.RecordDescription)
 	req.RecordItemXML = strings.TrimSpace(req.RecordItemXML)
+	req.RevokeTicket = strings.TrimSpace(req.RevokeTicket)
 	req.LocationLabel = strings.TrimSpace(req.LocationLabel)
 	req.LocationPoiName = strings.TrimSpace(req.LocationPoiName)
 	req.LocationInfoURL = strings.TrimSpace(req.LocationInfoURL)
@@ -273,6 +278,9 @@ func (req SendActionRequest) Validate(defaultDevice string) (SendActionRequest, 
 	req.LocationPoiTips = strings.TrimSpace(req.LocationPoiTips)
 	if req.SourceChatRecordID <= 0 && len(req.SourceChatRecordIDs) == 1 {
 		req.SourceChatRecordID = req.SourceChatRecordIDs[0]
+	}
+	if req.TargetChatRecordID <= 0 {
+		req.TargetChatRecordID = firstPositiveLong(req.SourceChatRecordID, req.QuoteChatRecordID, req.QuoteMsgID)
 	}
 	if req.QuoteMsgID <= 0 {
 		req.QuoteMsgID = req.QuoteChatRecordID
@@ -421,8 +429,15 @@ func (req SendActionRequest) Validate(defaultDevice string) (SendActionRequest, 
 				req.Text = req.RecordTitle
 			}
 		}
+	case OutboxKindRevoke:
+		if req.TargetChatRecordID <= 0 && req.TargetMsgSvrID <= 0 {
+			return req, errors.New("target_chat_record_id is required")
+		}
+		if req.Text == "" {
+			req.Text = "[撤回]"
+		}
 	default:
-		return req, errors.New("kind must be text, image, video, voice, file, emoji, location, quote, link, mini_program, or chat_history")
+		return req, errors.New("kind must be text, image, video, voice, file, emoji, location, quote, link, mini_program, chat_history, or revoke")
 	}
 	return req, nil
 }
@@ -432,6 +447,15 @@ func looksLikeRecordItemXML(value string) bool {
 	return strings.HasPrefix(value, "<recordinfo") ||
 		strings.HasPrefix(value, "<recorditem") ||
 		strings.HasPrefix(value, "<![cdata[<recordinfo")
+}
+
+func firstPositiveLong(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 type ModuleRegistrationRequest struct {

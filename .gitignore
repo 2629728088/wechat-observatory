@@ -22,9 +22,9 @@ android-module/app/build/
 .env.*
 !.env.example
 backups/
+.codex-backups/
 __pycache__/
 *.py[cod]
-.Destination}}{{end}}
 *.db
 *.sqlite
 *.sqlite3
@@ -33,6 +33,3 @@ __pycache__/
 *.p12
 *.pem
 *.key
-
-# Stray local shell/template output
- .Destination}}{{end}}

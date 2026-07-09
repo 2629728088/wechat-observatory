@@ -30,6 +30,69 @@ func TestNormalizeAppMsgLink(t *testing.T) {
 	}
 }
 
+func TestNormalizeImageMessageExtractsCDNURLFallback(t *testing.T) {
+	event := MessageEvent{
+		MessageType: 3,
+		RawXML:      `<msg><img aeskey="" cdnmidimgurl="https://gchat.qpic.cn/gchatpic_new/0/0-0-ABC/0" cdnthumburl="https://gchat.qpic.cn/thumb/0" length="19418" md5="abcdef0123456789" /></msg>`,
+	}.Normalize()
+
+	if event.MessageKind != MessageKindImage || event.MediaKind != MessageKindImage {
+		t.Fatalf("unexpected image classification: %+v", event)
+	}
+	if event.MediaURL != "https://gchat.qpic.cn/gchatpic_new/0/0-0-ABC/0" || event.MediaSize != 19418 {
+		t.Fatalf("unexpected image media fallback: %+v", event)
+	}
+	if event.MediaName != "abcdef0123456789.jpg" || event.MediaMime != "image/jpeg" {
+		t.Fatalf("unexpected image media metadata: %+v", event)
+	}
+	if event.Text != "[图片]" || event.RawXML != "" {
+		t.Fatalf("unexpected image text/raw xml: %+v", event)
+	}
+	if !containsString(event.Evidence, "raw_xml.img.cdnmidimgurl") || !containsString(event.Evidence, "raw_xml.img.length") {
+		t.Fatalf("image evidence missing: %+v", event.Evidence)
+	}
+}
+
+func TestNormalizeImageMessageKeepsExistingMediaURL(t *testing.T) {
+	event := MessageEvent{
+		MessageType: 3,
+		MediaURL:    "/api/media/device/day/local.jpg",
+		RawXML:      `<msg><img cdnmidimgurl="https://example.test/remote.jpg" length="123" /></msg>`,
+	}.Normalize()
+
+	if event.MediaURL != "/api/media/device/day/local.jpg" {
+		t.Fatalf("existing local media URL should be kept: %+v", event)
+	}
+	if event.MediaSize != 123 {
+		t.Fatalf("image length should still enrich metadata: %+v", event)
+	}
+}
+
+func TestNormalizeImageMessageExtractsFallbackFromMalformedXML(t *testing.T) {
+	event := MessageEvent{
+		MessageType: 3,
+		RawXML:      `<msg><img cdnmidimgurl='https://example.test/fallback.jpg' length='77'></msg>`,
+	}.Normalize()
+
+	if event.MediaURL != "https://example.test/fallback.jpg" || event.MediaSize != 77 {
+		t.Fatalf("malformed image xml fallback failed: %+v", event)
+	}
+}
+
+func TestNormalizeImageMessageDoesNotSynthesizeCDNURLFromMD5(t *testing.T) {
+	event := MessageEvent{
+		MessageType: 3,
+		RawXML:      `<msg><img cdnmidimgurl="3071020100044f304d" cdnthumburl="3057020100044f304d" length="102217" md5="713679214c7286f239323c0d5949eccc" /></msg>`,
+	}.Normalize()
+
+	if event.MediaURL != "" {
+		t.Fatalf("non-http WeChat CDN fields must not become downloadable URLs: %+v", event)
+	}
+	if event.MediaName != "713679214c7286f239323c0d5949eccc.jpg" || event.MediaSize != 102217 || event.MediaMime != "" {
+		t.Fatalf("unexpected image metadata from non-http CDN fields: %+v", event)
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
@@ -504,5 +567,25 @@ func TestNormalizeSystemMessageTypeIsExplicit(t *testing.T) {
 	}
 	if event.Text != "[系统消息]" {
 		t.Fatalf("system message should get a safe display text, got %q", event.Text)
+	}
+}
+
+func TestNormalizeSystemRevokeMessage(t *testing.T) {
+	event := MessageEvent{
+		MessageType: 10000,
+		RawXML:      `<sysmsg type="revokemsg"><revokemsg><session>room-a@chatroom</session><oldmsgid>12345</oldmsgid><newmsgid>67890</newmsgid><replacemsg><![CDATA["Alice" 撤回了一条消息]]></replacemsg></revokemsg></sysmsg>`,
+	}.Normalize()
+
+	if event.MessageKind != MessageKindSystem || event.AppMsgSubtype != SystemSubtypeRevoke {
+		t.Fatalf("unexpected revoke system message: %+v", event)
+	}
+	if event.AppMsgURL != "room-a@chatroom" || event.AppMsgFileName != "12345" || event.AppMsgAppName != "67890" {
+		t.Fatalf("revoke identifiers not parsed: %+v", event)
+	}
+	if event.Text != `"Alice" 撤回了一条消息` || event.RawXML != "" {
+		t.Fatalf("revoke display/raw xml mismatch: text=%q raw=%q", event.Text, event.RawXML)
+	}
+	if !containsString(event.Evidence, "raw_xml.sysmsg.revokemsg") || !containsString(event.Evidence, "raw_xml.sysmsg.revokemsg.msgid") {
+		t.Fatalf("revoke evidence missing: %+v", event.Evidence)
 	}
 }

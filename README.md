@@ -127,14 +127,21 @@ npm run build
 
 ### 5. 构建 Android 模块
 
-当前仓库没有强制要求提交 Gradle Wrapper。推荐在发布前补充 Wrapper；没有 Wrapper 时，可用 Android Studio 打开 `android-module` 并执行 debug 构建。
-
-如果仓库已包含 Gradle Wrapper：
+使用仓库内 Gradle Wrapper 构建 debug APK：
 
 ```powershell
 cd android-module
 .\gradlew.bat :app:assembleDebug
 ```
+
+macOS/Linux 使用：
+
+```bash
+cd android-module
+./gradlew :app:assembleDebug
+```
+
+Wrapper 首次运行会从 Gradle 官方分发源下载对应版本；离线服务器可改用 Android Studio，或配置本机 Gradle/`GRADLE_BIN` 后再执行验证脚本。
 
 安装 APK 后，在 LSPosed 中启用模块并勾选微信作用域，然后重启手机或重启微信。
 
@@ -211,7 +218,7 @@ cd android-module
 .\gradlew.bat :app:assembleDebug
 ```
 
-如果当前检出没有 `gradlew.bat`，请用 Android Studio 打开 `android-module` 构建，或先为项目补充 Gradle Wrapper。
+macOS/Linux 使用 `./gradlew :app:assembleDebug`。也可以用 Android Studio 打开 `android-module` 构建同一个 debug 变体。
 
 ## 文档
 

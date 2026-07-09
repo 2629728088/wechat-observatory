@@ -139,7 +139,7 @@ export async function sendText(params: {
   wxid: string;
   text: string;
 }) {
-  return requestJSON<{ ok: boolean; chat_record_id?: number }>("/api/send/text", {
+  return requestJSON<{ ok: boolean; outbox_id?: number; queued?: boolean; status_url?: string }>("/api/send/text", {
     password: params.password,
     method: "POST",
     body: {
@@ -162,7 +162,8 @@ export const SEND_ACTION_KINDS = [
   "quote",
   "link",
   "mini_program",
-  "chat_history"
+  "chat_history",
+  "revoke"
 ] as const;
 
 export type SendActionKind = (typeof SEND_ACTION_KINDS)[number];
@@ -263,7 +264,7 @@ export function buildSendActionBody(params: SendActionParams) {
 }
 
 export async function sendAction(params: SendActionParams) {
-  return requestJSON<{ ok: boolean; chat_record_id?: number; outbox_id?: number }>("/api/send/action", {
+  return requestJSON<{ ok: boolean; outbox_id?: number; queued?: boolean; status_url?: string }>("/api/send/action", {
     password: params.password,
     method: "POST",
     body: buildSendActionBody(params)

@@ -13,6 +13,14 @@ type Persistence interface {
 	RecordOutboundEvent(ctx context.Context, event MessageEvent) error
 }
 
+type MessageEventLookup interface {
+	HasMessageEvent(ctx context.Context, event MessageEvent) (bool, error)
+}
+
+type MessageEventMediaLookup interface {
+	HasMessageEventMedia(ctx context.Context, event MessageEvent) (bool, error)
+}
+
 type DeviceLocator interface {
 	LookupDeviceByWxID(ctx context.Context, wxid string) (config.Device, bool, error)
 }

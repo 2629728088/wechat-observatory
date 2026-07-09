@@ -31,7 +31,7 @@ INCLUDE_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
-INCLUDE_NAMES = {"Dockerfile", "Makefile"}
+INCLUDE_NAMES = {".gitattributes", ".gitignore", "Dockerfile", "Makefile", "gradlew", "gradlew.bat"}
 SKIP_PREFIXES = (
     "backups/",
     "internal/bridge/admin_dist/",
@@ -39,6 +39,10 @@ SKIP_PREFIXES = (
 )
 SKIP_PARTS = {"__pycache__", ".git"}
 CONFLICT_MARKERS = ("<<<<<<< ", "=======", ">>>>>>> ")
+STRAY_TEMPLATE_MARKERS = (
+    ".Destination" + "}}{{end}}",
+    r".Destination" + r"\}\}\{\{end\}\}",
+)
 
 
 def git_files(root: Path) -> list[str]:
@@ -64,6 +68,8 @@ def check_text(path: str, text: str) -> list[dict[str, object]]:
             findings.append({"path": path, "line": line_number, "code": "trailing_whitespace"})
         if line.startswith(CONFLICT_MARKERS):
             findings.append({"path": path, "line": line_number, "code": "conflict_marker"})
+        if any(marker in line for marker in STRAY_TEMPLATE_MARKERS):
+            findings.append({"path": path, "line": line_number, "code": "stray_template_marker"})
     return findings
 
 

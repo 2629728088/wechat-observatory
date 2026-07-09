@@ -80,7 +80,7 @@ REQUIRED_DOC_LINKS = [
     "public-api-python-client-v1.md",
 ]
 ALLOWED_INBOUND_STATUSES = {"stable", "basic", "structured", "parse_only", "preserved"}
-ALLOWED_OUTBOUND_STATUSES = {"stable", "implemented", "sample_only", "source_forward_stable", "source_forward_only", "unsupported", "non_goal"}
+ALLOWED_OUTBOUND_STATUSES = {"stable", "implemented", "sample_only", "source_forward_stable", "source_forward_only", "private_verified", "unsupported", "non_goal"}
 ALLOWED_VERIFICATION_LEVELS = {"user_confirmed", "db_verified", "sample_only", "parse_only"}
 NON_SENDABLE_OUTBOUND_STATUSES = {"unsupported", "non_goal"}
 MINIMAL_AMR_BASE64 = base64.b64encode(b"#!AMR\n" + bytes([0x7C]) * 50).decode("ascii")

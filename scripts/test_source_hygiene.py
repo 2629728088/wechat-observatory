@@ -13,6 +13,9 @@ import validate_source_hygiene as hygiene
 class SourceHygieneTests(unittest.TestCase):
     def test_should_check_source_like_paths_and_skip_generated_files(self) -> None:
         self.assertTrue(hygiene.should_check_path("scripts/verify_project.py"))
+        self.assertTrue(hygiene.should_check_path(".gitignore"))
+        self.assertTrue(hygiene.should_check_path("android-module/gradlew"))
+        self.assertTrue(hygiene.should_check_path("android-module/gradlew.bat"))
         self.assertTrue(hygiene.should_check_path("Dockerfile"))
         self.assertTrue(hygiene.should_check_path("docs/message-fixtures/public-api-v1.text.json"))
         self.assertFalse(hygiene.should_check_path("backups/old.go"))
@@ -28,6 +31,16 @@ class SourceHygieneTests(unittest.TestCase):
             [
                 {"path": "scripts/example.py", "line": 2, "code": "trailing_whitespace"},
                 {"path": "scripts/example.py", "line": 3, "code": "conflict_marker"},
+            ],
+        )
+
+    def test_check_text_reports_stray_template_markers(self) -> None:
+        findings = hygiene.check_text(".gitignore", "ok\n .Destination\\}\\}\\{\\{end\\}\\}\n")
+
+        self.assertEqual(
+            findings,
+            [
+                {"path": ".gitignore", "line": 2, "code": "stray_template_marker"},
             ],
         )
 

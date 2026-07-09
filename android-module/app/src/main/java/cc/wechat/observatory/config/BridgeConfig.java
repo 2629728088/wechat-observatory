@@ -33,6 +33,7 @@ public final class BridgeConfig {
     public String nickname;
     public long pollIntervalMs;
     public int pollLimit;
+    public int outboxParallelism;
     public long contactSyncIntervalMs;
     public int contactSyncLimit;
     public boolean includeChatrooms;
@@ -54,7 +55,11 @@ public final class BridgeConfig {
         config.apiKey = setting(properties, "api_key", "");
         config.nickname = "";
         config.pollIntervalMs = longSetting(properties, "poll_interval_ms", 1000L);
-        config.pollLimit = (int) longSetting(properties, "poll_limit", 20L);
+        config.outboxParallelism = boundedIntSetting(properties, "outbox_parallelism", 4, 1, 8);
+        config.pollLimit = boundedIntSetting(properties, "poll_limit", 20, 1, 50);
+        if (config.pollLimit < config.outboxParallelism) {
+            config.pollLimit = config.outboxParallelism;
+        }
         config.contactSyncIntervalMs = longSetting(properties, "contact_sync_interval_ms", 600000L);
         config.contactSyncLimit = (int) longSetting(properties, "contact_sync_limit", 1000L);
         config.includeChatrooms = booleanSetting(properties, "contact_include_chatrooms", true);
@@ -287,6 +292,8 @@ public final class BridgeConfig {
                 + " selfWxid=" + (Strings.isBlank(config.selfWxid) ? "<empty>" : config.selfWxid)
                 + " apiKey=" + (Strings.isBlank(config.apiKey) ? "<empty>" : "<set>")
                 + " pollIntervalMs=" + config.pollIntervalMs
+                + " pollLimit=" + config.pollLimit
+                + " outboxParallelism=" + config.outboxParallelism
                 + " includeChatrooms=" + config.includeChatrooms
                 + " targetAndroidUserId=" + config.targetAndroidUserId);
     }
@@ -318,6 +325,17 @@ public final class BridgeConfig {
         }
     }
 
+    private static int boundedIntSetting(Properties properties, String name, int fallback, int min, int max) {
+        long value = longSetting(properties, name, fallback);
+        if (value < min) {
+            return min;
+        }
+        if (value > max) {
+            return max;
+        }
+        return (int) value;
+    }
+
     private static boolean booleanSetting(Properties properties, String name, boolean fallback) {
         try {
             String value = properties.getProperty(name);
@@ -339,6 +357,7 @@ public final class BridgeConfig {
                 "api_key",
                 "poll_interval_ms",
                 "poll_limit",
+                "outbox_parallelism",
                 "contact_sync_interval_ms",
                 "contact_sync_limit",
                 "contact_include_chatrooms",

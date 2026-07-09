@@ -267,20 +267,30 @@ curl -X POST   -H "X-Bridge-API-Key: <your-api-key>"   -H "Content-Type: applica
   "protocol_version": "v1",
   "kind": "text",
   "outbox_id": 1001,
-  "chat_record_id": 1001,
+  "outbox_ids": [1001],
   "status_url": "/api/v1/outbox/1001",
   "outbox": {
     "id": 1001,
     "device": "phone-a",
     "target_wxid": "<target-wxid-or-room-id>",
     "kind": "text",
-    "status": "queued",
+    "status": "pending",
     "status_url": "/api/v1/outbox/1001"
-  }
+  },
+  "outboxes": [
+    {
+      "id": 1001,
+      "device": "phone-a",
+      "target_wxid": "<target-wxid-or-room-id>",
+      "kind": "text",
+      "status": "pending",
+      "status_url": "/api/v1/outbox/1001"
+    }
+  ]
 }
 ```
 
-发送接口返回只代表任务已入队。真实结果以手机模块 ACK 后的 outbox 状态为准。
+发送接口返回只代表任务已入队。多目标发送时看 `outbox_ids` / `outboxes` 跟踪每个目标；`outbox_id` / `outbox` 保留为兼容字段，指向第一个目标。真实结果以手机模块 ACK 后的 outbox 状态为准；真实微信本地消息 ID 会出现在终态 outbox 的 `chat_record_id` 字段里。
 
 ## 查询发送状态
 

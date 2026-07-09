@@ -69,6 +69,7 @@ LEGACY_INBOUND_ENVELOPE_FIELDS = {
     "location_info_url",
     "location_poi_id",
 }
+PRE_ACK_OUTBOX_STATUSES = {"pending", "leased", "queued"}
 
 
 def fail(message: str) -> None:
@@ -126,9 +127,24 @@ def validate_fixture(path: Path) -> str:
         response = data.get("send_response")
         if not isinstance(response, dict) or response.get("protocol_version") != "v1" or "outbox_id" not in response:
             fail(f"{path}: send_response must include protocol_version and outbox_id")
+        response_outbox = response.get("outbox")
+        if response.get("chat_record_id") == response.get("outbox_id"):
+            fail(f"{path}: send_response.chat_record_id must not mirror outbox_id")
+        if isinstance(response_outbox, dict):
+            response_status = response_outbox.get("status")
+            if response_outbox.get("chat_record_id") == response.get("outbox_id"):
+                fail(f"{path}: send_response.outbox.chat_record_id must not mirror outbox_id")
+            if response_status in PRE_ACK_OUTBOX_STATUSES:
+                if "chat_record_id" in response:
+                    fail(f"{path}: send_response.chat_record_id must be omitted until module ACK")
+                if "chat_record_id" in response_outbox:
+                    fail(f"{path}: send_response.outbox.chat_record_id must be omitted until module ACK")
         terminal = data.get("outbox_terminal")
         if not isinstance(terminal, dict) or (terminal.get("outbox") or {}).get("status") not in {"sent", "failed"}:
             fail(f"{path}: outbox_terminal.outbox.status must be sent or failed")
+        terminal_outbox = terminal.get("outbox") or {}
+        if terminal_outbox.get("status") == "sent" and not isinstance(terminal_outbox.get("chat_record_id"), int):
+            fail(f"{path}: sent outbox_terminal.outbox.chat_record_id is required")
     return fixture_id
 
 

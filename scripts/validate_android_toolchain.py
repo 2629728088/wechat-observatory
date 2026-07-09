@@ -106,6 +106,14 @@ def gradle_wrapper_files(android_module: Path = ANDROID_MODULE) -> dict[str, boo
     }
 
 
+def gradle_wrapper_complete(wrapper: dict[str, bool]) -> bool:
+    return all(wrapper.values())
+
+
+def gradle_wrapper_present(wrapper: dict[str, bool]) -> bool:
+    return any(wrapper.values())
+
+
 def apk_outputs(apk_output_dir: Path = APK_OUTPUT_DIR, root: Path = ROOT, command_lookup=command_path) -> list[dict[str, Any]]:
     outputs: list[dict[str, Any]] = []
     if not apk_output_dir.exists():
@@ -179,9 +187,12 @@ def collect_report(
     android_jars = find_android_jars(roots)
     compile_sdk = read_compile_sdk(app_build)
     compile_sdk_jar_present = has_compile_sdk_jar(android_jars, compile_sdk)
+    wrapper_complete = gradle_wrapper_complete(wrapper)
 
     blockers: list[str] = []
-    if not commands["gradle"] and not (wrapper["gradlew"] and wrapper["wrapper_jar"] and wrapper["wrapper_properties"]):
+    if gradle_wrapper_present(wrapper) and not wrapper_complete:
+        blockers.append("incomplete_gradle_wrapper")
+    if not commands["gradle"] and not wrapper_complete:
         blockers.append("missing_gradle_or_project_wrapper")
     if compile_sdk and not compile_sdk_jar_present:
         blockers.append(f"missing_android_platform_android_jar_for_compileSdk_{compile_sdk}")
@@ -201,6 +212,7 @@ def collect_report(
         "android_roots": [str(path) for path in roots],
         "gradle_candidate_paths": [str(path) for path in (gradle_candidates if gradle_candidates is not None else default_gradle_candidates())],
         "gradle_wrapper": wrapper,
+        "gradle_wrapper_complete": wrapper_complete,
         "android_jar_count": len(android_jars),
         "compile_sdk_jar_present": compile_sdk_jar_present,
         "apk_output_count": len(apks),

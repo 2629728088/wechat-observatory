@@ -54,6 +54,7 @@ class AndroidToolchainReportTests(unittest.TestCase):
             wrapper_dir = android_module / "gradle" / "wrapper"
             wrapper_dir.mkdir(parents=True)
             (android_module / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")
+            (android_module / "gradlew.bat").write_text("@echo off\n", encoding="utf-8")
             (wrapper_dir / "gradle-wrapper.jar").write_bytes(b"jar")
             (wrapper_dir / "gradle-wrapper.properties").write_text("distributionUrl=https://example.invalid/gradle.zip\n", encoding="utf-8")
             sdk = root / "sdk"
@@ -73,7 +74,34 @@ class AndroidToolchainReportTests(unittest.TestCase):
         self.assertTrue(report["build_ready"])
         self.assertEqual(report["blockers"], [])
         self.assertTrue(report["gradle_wrapper"]["gradlew"])
+        self.assertTrue(report["gradle_wrapper"]["gradlew_bat"])
+        self.assertTrue(report["gradle_wrapper_complete"])
         self.assertTrue(report["compile_sdk_jar_present"])
+
+    def test_partial_project_wrapper_is_reported_as_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            android_module, app_build, apk_dir = make_project(root)
+            (android_module / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")
+            sdk = root / "sdk"
+            android_jar = sdk / "platforms" / "android-35" / "android.jar"
+            android_jar.parent.mkdir(parents=True)
+            android_jar.write_bytes(b"android")
+
+            report = toolchain.collect_report(
+                root=root,
+                android_module=android_module,
+                app_build=app_build,
+                apk_output_dir=apk_dir,
+                android_roots=[sdk],
+                gradle_candidates=[],
+                command_lookup=command_lookup({"java": "/bin/java", "javac": "/bin/javac", "aapt2": "/bin/aapt2"}),
+            )
+
+        self.assertFalse(report["build_ready"])
+        self.assertIn("incomplete_gradle_wrapper", report["blockers"])
+        self.assertIn("missing_gradle_or_project_wrapper", report["blockers"])
+        self.assertFalse(report["gradle_wrapper_complete"])
 
     def test_gradle_candidate_and_env_android_root_make_toolchain_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

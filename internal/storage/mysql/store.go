@@ -504,6 +504,34 @@ func (s *Store) RecordOutboundEvent(ctx context.Context, event bridge.MessageEve
 	return s.recordMessageEvent(ctx, event)
 }
 
+func (s *Store) HasMessageEvent(ctx context.Context, event bridge.MessageEvent) (bool, error) {
+	return s.hasMessageEventMatching(ctx, event, messageEventDedupExistsStatement)
+}
+
+func (s *Store) HasMessageEventMedia(ctx context.Context, event bridge.MessageEvent) (bool, error) {
+	return s.hasMessageEventMatching(ctx, event, messageEventDedupMediaExistsStatement)
+}
+
+func (s *Store) hasMessageEventMatching(ctx context.Context, event bridge.MessageEvent, statement string) (bool, error) {
+	if event.ChatRecordID <= 0 {
+		return false, nil
+	}
+	var id int64
+	err := s.db.QueryRowContext(ctx, statement,
+		strings.TrimSpace(event.Device),
+		nullString(event.OwnerWxID),
+		string(event.Direction),
+		event.ChatRecordID,
+	).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 const messageEventDedupUpdateStatement = `
 	UPDATE bridge_message_events
 	SET
@@ -557,6 +585,17 @@ const messageEventDedupExistsStatement = `
 		AND owner_wxid <=> ?
 		AND direction = ?
 		AND chat_record_id = ?
+	LIMIT 1`
+
+const messageEventDedupMediaExistsStatement = `
+	SELECT id
+	FROM bridge_message_events
+	WHERE device = ?
+		AND owner_wxid <=> ?
+		AND direction = ?
+		AND chat_record_id = ?
+		AND media_url IS NOT NULL
+		AND media_url <> ''
 	LIMIT 1`
 
 func (s *Store) RecordModuleActivity(ctx context.Context, activity bridge.ModuleActivity) error {
@@ -872,7 +911,7 @@ func (s *Store) listOutboxItemsForDevice(ctx context.Context, ids []int64, devic
 }
 
 func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEvent) error {
-	if event.ChatRecordID > 0 {
+	if event.ChatRecordID > 0 && !messageEventRequiresAppend(event) {
 		updated, err := s.updateMessageEventByChatRecordID(ctx, event)
 		if err != nil {
 			return err
@@ -932,6 +971,11 @@ func (s *Store) recordMessageEvent(ctx context.Context, event bridge.MessageEven
 		event.Timestamp(),
 	)
 	return err
+}
+
+func messageEventRequiresAppend(event bridge.MessageEvent) bool {
+	return strings.TrimSpace(event.MessageKind) == bridge.MessageKindSystem &&
+		strings.TrimSpace(event.AppMsgSubtype) == bridge.SystemSubtypeRevoke
 }
 
 func (s *Store) updateMessageEventByChatRecordID(ctx context.Context, event bridge.MessageEvent) (bool, error) {

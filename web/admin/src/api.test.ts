@@ -55,7 +55,8 @@ describe("buildSendActionBody", () => {
       "quote",
       "link",
       "mini_program",
-      "chat_history"
+      "chat_history",
+      "revoke"
     ]);
     expect(new Set(SEND_ACTION_KINDS).size).toBe(SEND_ACTION_KINDS.length);
   });
@@ -280,7 +281,7 @@ describe("buildSendActionBody", () => {
   });
 
   it("keeps text send body compatible with the legacy endpoint", async () => {
-    const fetchMock = stubJSONResponse({ ok: true, chat_record_id: 10 });
+    const fetchMock = stubJSONResponse({ ok: true, outbox_id: 10, queued: true, status_url: "/api/v1/outbox/10" });
 
     await sendText({
       password: "admin-password",

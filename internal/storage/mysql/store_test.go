@@ -184,6 +184,27 @@ func TestMessageEventDedupUpdatePromotesObservedEventOverAckPlaceholder(t *testi
 	}
 }
 
+func TestSystemRevokeMessageEventBypassesChatRecordDedup(t *testing.T) {
+	if messageEventRequiresAppend(bridge.MessageEvent{
+		MessageKind:   bridge.MessageKindText,
+		AppMsgSubtype: bridge.SystemSubtypeRevoke,
+	}) {
+		t.Fatalf("non-system event should keep chat_record_id dedup")
+	}
+	if messageEventRequiresAppend(bridge.MessageEvent{
+		MessageKind:   bridge.MessageKindSystem,
+		AppMsgSubtype: "notice",
+	}) {
+		t.Fatalf("non-revoke system event should keep chat_record_id dedup")
+	}
+	if !messageEventRequiresAppend(bridge.MessageEvent{
+		MessageKind:   bridge.MessageKindSystem,
+		AppMsgSubtype: bridge.SystemSubtypeRevoke,
+	}) {
+		t.Fatalf("system revoke event should be appended as a distinct event")
+	}
+}
+
 func TestListMessagesQuerySupportsChatRooms(t *testing.T) {
 	query, args := listMessagesQuery(bridge.MessageFilter{
 		Device:   "phone-a",

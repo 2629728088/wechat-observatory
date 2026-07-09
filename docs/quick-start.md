@@ -70,13 +70,23 @@ cd ../..
 
 ## 5. 构建 Android 模块
 
-没有 Gradle Wrapper 时，直接用 Android Studio 打开 `android-module` 并构建 debug APK。若仓库已经补充 Wrapper，可使用命令行：
+使用仓库内 Gradle Wrapper 构建 debug APK：
 
 ```powershell
 cd android-module
 .\gradlew.bat :app:assembleDebug
 cd ..
 ```
+
+macOS/Linux 使用：
+
+```bash
+cd android-module
+./gradlew :app:assembleDebug
+cd ..
+```
+
+Wrapper 首次运行会下载 Gradle 分发包；如果当前环境不能访问 Gradle 官方分发源，可以用 Android Studio 构建，或配置本机 Gradle/`GRADLE_BIN` 后运行验证脚本。
 
 APK 位于：
 

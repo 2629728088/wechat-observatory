@@ -31,6 +31,8 @@ const (
 	MessageKindChatHistory = "chat_history"
 	MessageKindSystem      = "system"
 	MessageKindUnknown     = "unknown"
+
+	SystemSubtypeRevoke = "revoke"
 )
 
 type appMsgXMLDocument struct {
@@ -62,6 +64,19 @@ type appMsgWeAppXML struct {
 	AppID    string `xml:"appid"`
 }
 
+type imageXMLDocument struct {
+	Image imageXML `xml:"img"`
+}
+
+type imageXML struct {
+	AESKey      string `xml:"aeskey,attr"`
+	CDNBigURL   string `xml:"cdnbigimgurl,attr"`
+	CDNMidURL   string `xml:"cdnmidimgurl,attr"`
+	CDNThumbURL string `xml:"cdnthumburl,attr"`
+	Length      string `xml:"length,attr"`
+	MD5         string `xml:"md5,attr"`
+}
+
 type emojiXMLDocument struct {
 	Emoji emojiXML `xml:"emoji"`
 }
@@ -76,6 +91,21 @@ type emojiXML struct {
 	CDNURL     string `xml:"cdnurl,attr"`
 	ThumbURL   string `xml:"thumburl,attr"`
 	ExternURL  string `xml:"externurl,attr"`
+}
+
+type systemXMLDocument struct {
+	Type      string          `xml:"type,attr"`
+	RevokeMsg systemRevokeXML `xml:"revokemsg"`
+}
+
+type systemRevokeXML struct {
+	Session    string `xml:"session"`
+	OldMsgID   string `xml:"oldmsgid"`
+	MsgID      string `xml:"msgid"`
+	NewMsgID   string `xml:"newmsgid"`
+	MsgSvrID   string `xml:"msgsvrid"`
+	SvrID      string `xml:"svrid"`
+	ReplaceMsg string `xml:"replacemsg"`
 }
 
 type locationXMLDocument struct {
@@ -146,6 +176,9 @@ func normalizeMessageEnvelope(event MessageEvent) MessageEvent {
 	if event.MessageType == MessageTypeQuote {
 		return normalizeQuoteMessage(event)
 	}
+	if event.MessageType == 3 {
+		return normalizeImageMessage(event)
+	}
 	if event.MessageType == 47 {
 		return normalizeEmojiMessage(event)
 	}
@@ -161,7 +194,7 @@ func normalizeMessageEnvelope(event MessageEvent) MessageEvent {
 			event.Evidence = appendUnique(event.Evidence, "message.type="+strconv.FormatInt(int64(event.MessageType), 10))
 		}
 		if event.MessageKind == MessageKindSystem && event.MessageType > 0 {
-			event.Evidence = appendUnique(event.Evidence, "message.type="+strconv.FormatInt(int64(event.MessageType), 10))
+			return normalizeSystemMessage(event)
 		}
 		if strings.TrimSpace(event.Text) == "" {
 			event.Text = defaultInboundDisplayText(event.MessageKind, event.MessageType)
@@ -235,6 +268,64 @@ func normalizeMessageEnvelope(event MessageEvent) MessageEvent {
 	return normalizeAppMsgMediaFields(event)
 }
 
+func normalizeSystemMessage(event MessageEvent) MessageEvent {
+	event.MessageKind = MessageKindSystem
+	event.Evidence = appendUnique(event.Evidence, "message.type="+strconv.FormatInt(int64(event.MessageType), 10))
+	rawXML := strings.TrimSpace(firstNonEmpty(event.RawXML, xmlCandidateFromText(event.Text)))
+	if isRevokeSystemXML(rawXML) {
+		revoke := parseSystemRevokeXML(rawXML)
+		event.AppMsgSubtype = SystemSubtypeRevoke
+		event.AppMsgTitle = compactDisplay(revoke.ReplaceMsg, 160)
+		event.AppMsgURL = compactSpace(revoke.Session)
+		event.AppMsgFileName = compactSpace(firstNonEmpty(revoke.OldMsgID, revoke.MsgID))
+		event.AppMsgAppName = compactSpace(firstNonEmpty(revoke.NewMsgID, revoke.MsgSvrID, revoke.SvrID))
+		event.Text = firstNonEmpty(event.AppMsgTitle, "[撤回消息]")
+		event.RawXML = ""
+		event.Evidence = appendUnique(event.Evidence, "raw_xml.sysmsg.revokemsg")
+		if event.AppMsgFileName != "" {
+			event.Evidence = appendUnique(event.Evidence, "raw_xml.sysmsg.revokemsg.msgid")
+		}
+		if event.AppMsgAppName != "" {
+			event.Evidence = appendUnique(event.Evidence, "raw_xml.sysmsg.revokemsg.newmsgid")
+		}
+		return event
+	}
+	if strings.TrimSpace(event.Text) == "" {
+		event.Text = defaultInboundDisplayText(event.MessageKind, event.MessageType)
+	}
+	event.RawXML = ""
+	return event
+}
+
+func isRevokeSystemXML(rawXML string) bool {
+	value := strings.ToLower(strings.TrimSpace(rawXML))
+	return strings.Contains(value, "revokemsg") || strings.Contains(value, "msgsvrcancel")
+}
+
+func parseSystemRevokeXML(rawXML string) systemRevokeXML {
+	var doc systemXMLDocument
+	if err := xml.Unmarshal([]byte(rawXML), &doc); err == nil {
+		revoke := doc.RevokeMsg
+		revoke.Session = firstNonEmpty(revoke.Session, xmlTagValue(rawXML, "session"))
+		revoke.OldMsgID = firstNonEmpty(revoke.OldMsgID, xmlTagValue(rawXML, "oldmsgid"))
+		revoke.MsgID = firstNonEmpty(revoke.MsgID, xmlTagValue(rawXML, "msgid"))
+		revoke.NewMsgID = firstNonEmpty(revoke.NewMsgID, xmlTagValue(rawXML, "newmsgid"))
+		revoke.MsgSvrID = firstNonEmpty(revoke.MsgSvrID, xmlTagValue(rawXML, "msgsvrid"))
+		revoke.SvrID = firstNonEmpty(revoke.SvrID, xmlTagValue(rawXML, "svrid"))
+		revoke.ReplaceMsg = firstNonEmpty(revoke.ReplaceMsg, xmlTagValue(rawXML, "replacemsg"))
+		return revoke
+	}
+	return systemRevokeXML{
+		Session:    xmlTagValue(rawXML, "session"),
+		OldMsgID:   xmlTagValue(rawXML, "oldmsgid"),
+		MsgID:      xmlTagValue(rawXML, "msgid"),
+		NewMsgID:   xmlTagValue(rawXML, "newmsgid"),
+		MsgSvrID:   xmlTagValue(rawXML, "msgsvrid"),
+		SvrID:      xmlTagValue(rawXML, "svrid"),
+		ReplaceMsg: xmlTagValue(rawXML, "replacemsg"),
+	}
+}
+
 func normalizeFileTransferMessage(event MessageEvent) MessageEvent {
 	event.MessageKind = MessageKindFile
 	event.MediaKind = firstNonEmpty(event.MediaKind, MessageKindFile)
@@ -244,6 +335,96 @@ func normalizeFileTransferMessage(event MessageEvent) MessageEvent {
 		event.Text = defaultInboundDisplayText(event.MessageKind, event.MessageType)
 	}
 	return event
+}
+
+func normalizeImageMessage(event MessageEvent) MessageEvent {
+	event.MessageKind = MessageKindImage
+	event.MediaKind = firstNonEmpty(event.MediaKind, MessageKindImage)
+	event.Evidence = appendUnique(event.Evidence, "message.type=3")
+
+	rawXML := strings.TrimSpace(firstNonEmpty(event.RawXML, xmlCandidateFromText(event.Text)))
+	if rawXML != "" {
+		parsed, ok := parseImageXML(rawXML)
+		event.RawXML = ""
+		if ok {
+			event.Evidence = appendUnique(event.Evidence, "raw_xml.img")
+			event.Evidence = appendUnique(event.Evidence, imageStructuralEvidence(parsed)...)
+			if strings.TrimSpace(event.MediaURL) == "" {
+				event.MediaURL = imageCDNURL(parsed)
+			}
+			if event.MediaSize <= 0 {
+				event.MediaSize = parseInt64(parsed.Length)
+			}
+			if strings.TrimSpace(event.MediaName) == "" {
+				event.MediaName = imageMediaName(parsed)
+			}
+			if strings.TrimSpace(event.MediaMime) == "" && strings.TrimSpace(event.MediaURL) != "" {
+				event.MediaMime = "image/jpeg"
+			}
+		} else {
+			event.Unsupported = appendUnique(event.Unsupported, "image_xml_parse_failed")
+		}
+	}
+	if strings.TrimSpace(event.Text) == "" || looksLikeXML(event.Text) {
+		event.Text = "[图片]"
+	}
+	return event
+}
+
+func parseImageXML(rawXML string) (imageXML, bool) {
+	var doc imageXMLDocument
+	if err := xml.Unmarshal([]byte(rawXML), &doc); err == nil {
+		if strings.TrimSpace(firstNonEmpty(doc.Image.CDNBigURL, doc.Image.CDNMidURL, doc.Image.CDNThumbURL, doc.Image.MD5, doc.Image.Length)) != "" {
+			return doc.Image, true
+		}
+	}
+	parsed := imageXML{
+		CDNBigURL:   xmlAttrValue(rawXML, "img", "cdnbigimgurl"),
+		CDNMidURL:   xmlAttrValue(rawXML, "img", "cdnmidimgurl"),
+		CDNThumbURL: xmlAttrValue(rawXML, "img", "cdnthumburl"),
+		Length:      xmlAttrValue(rawXML, "img", "length"),
+		MD5:         xmlAttrValue(rawXML, "img", "md5"),
+	}
+	return parsed, strings.TrimSpace(firstNonEmpty(parsed.CDNBigURL, parsed.CDNMidURL, parsed.CDNThumbURL, parsed.MD5, parsed.Length)) != ""
+}
+
+func imageCDNURL(parsed imageXML) string {
+	for _, value := range []string{parsed.CDNBigURL, parsed.CDNMidURL, parsed.CDNThumbURL} {
+		url := normalizeWeChatEscapedURL(value)
+		lower := strings.ToLower(url)
+		if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+			return url
+		}
+	}
+	return ""
+}
+
+func imageMediaName(parsed imageXML) string {
+	md5 := compactSpace(parsed.MD5)
+	if md5 == "" {
+		return "wechat-image.jpg"
+	}
+	return md5 + ".jpg"
+}
+
+func imageStructuralEvidence(parsed imageXML) []string {
+	evidence := []string{}
+	if strings.TrimSpace(parsed.CDNBigURL) != "" {
+		evidence = append(evidence, "raw_xml.img.cdnbigimgurl")
+	}
+	if strings.TrimSpace(parsed.CDNMidURL) != "" {
+		evidence = append(evidence, "raw_xml.img.cdnmidimgurl")
+	}
+	if strings.TrimSpace(parsed.CDNThumbURL) != "" {
+		evidence = append(evidence, "raw_xml.img.cdnthumburl")
+	}
+	if strings.TrimSpace(parsed.Length) != "" {
+		evidence = append(evidence, "raw_xml.img.length")
+	}
+	if strings.TrimSpace(parsed.MD5) != "" {
+		evidence = append(evidence, "raw_xml.img.md5")
+	}
+	return evidence
 }
 
 func normalizeEmojiMessage(event MessageEvent) MessageEvent {
@@ -797,6 +978,14 @@ func parseBoolField(value string) bool {
 	}
 }
 
+func parseInt64(value string) int64 {
+	parsed, ok := parseIntField(value)
+	if !ok {
+		return 0
+	}
+	return int64(parsed)
+}
+
 func messageKindForType(messageType int32) string {
 	switch messageType {
 	case 1:
@@ -1008,6 +1197,33 @@ func compactDisplay(value string, limit int) string {
 	}
 	runes := []rune(value)
 	return string(runes[:limit]) + "..."
+}
+
+func xmlAttrValue(rawXML string, tag string, attr string) string {
+	if strings.TrimSpace(rawXML) == "" || strings.TrimSpace(tag) == "" || strings.TrimSpace(attr) == "" {
+		return ""
+	}
+	pattern := regexp.MustCompile(`(?is)<` + regexp.QuoteMeta(tag) + `\b[^>]*\s` + regexp.QuoteMeta(attr) + `\s*=\s*["']([^"']*)["']`)
+	match := pattern.FindStringSubmatch(rawXML)
+	if len(match) < 2 {
+		return ""
+	}
+	return compactSpace(match[1])
+}
+
+func xmlTagValue(rawXML string, tag string) string {
+	if strings.TrimSpace(rawXML) == "" || strings.TrimSpace(tag) == "" {
+		return ""
+	}
+	pattern := regexp.MustCompile(`(?is)<` + regexp.QuoteMeta(tag) + `\b[^>]*>(.*?)</` + regexp.QuoteMeta(tag) + `>`)
+	match := pattern.FindStringSubmatch(rawXML)
+	if len(match) < 2 {
+		return ""
+	}
+	value := strings.TrimSpace(match[1])
+	value = strings.TrimPrefix(value, "<![CDATA[")
+	value = strings.TrimSuffix(value, "]]>")
+	return compactSpace(value)
 }
 
 func appendUnique(values []string, additions ...string) []string {

@@ -25,6 +25,19 @@ func TestAdminSendTextRequiresCurrentOwnerWxID(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
 	}
+	var sendResponse struct {
+		OK           bool   `json:"ok"`
+		OutboxID     int64  `json:"outbox_id"`
+		Queued       bool   `json:"queued"`
+		StatusURL    string `json:"status_url"`
+		ChatRecordID *int64 `json:"chat_record_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sendResponse); err != nil {
+		t.Fatalf("send response should be json: %v", err)
+	}
+	if !sendResponse.OK || sendResponse.OutboxID <= 0 || !sendResponse.Queued || sendResponse.StatusURL != publicOutboxStatusURL(sendResponse.OutboxID) || sendResponse.ChatRecordID != nil {
+		t.Fatalf("legacy text endpoint should return queued outbox metadata, got %+v", sendResponse)
+	}
 	items := pollOutbox(t, service, "phone-a", 10)
 	if len(items) != 1 || items[0].OwnerWxID != "wxid_self" || items[0].WxID != "wxid_friend" || items[0].Text != "manual reply" {
 		t.Fatalf("unexpected outbox items: %+v", items)
@@ -52,6 +65,34 @@ func TestAdminSendTextRequiresCurrentOwnerWxID(t *testing.T) {
 	}
 }
 
+func TestAdminSendActionReturnsQueuedOutboxID(t *testing.T) {
+	service := newTestService("")
+	server := NewHTTPServer(service, "admin").Handler()
+
+	body := []byte(`{"device":"phone-a","owner_wxid":"wxid_self","wx_ids":["wxid_friend"],"kind":"text","text":"manual action"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/send/action", bytes.NewReader(body))
+	req.Header.Set("X-Bridge-Password", "admin")
+	rec := httptest.NewRecorder()
+	server.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d body=%s", rec.Code, rec.Body.String())
+	}
+	var sendResponse struct {
+		OK           bool   `json:"ok"`
+		OutboxID     int64  `json:"outbox_id"`
+		Queued       bool   `json:"queued"`
+		StatusURL    string `json:"status_url"`
+		ChatRecordID *int64 `json:"chat_record_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sendResponse); err != nil {
+		t.Fatalf("send action response should be json: %v", err)
+	}
+	if !sendResponse.OK || sendResponse.OutboxID <= 0 || !sendResponse.Queued || sendResponse.StatusURL != publicOutboxStatusURL(sendResponse.OutboxID) || sendResponse.ChatRecordID != nil {
+		t.Fatalf("legacy action endpoint should return queued outbox metadata, got %+v", sendResponse)
+	}
+}
+
 func TestPublicV1CapabilitiesDescribeProtocolWithoutSecrets(t *testing.T) {
 	service := newTestService("")
 	server := NewHTTPServer(service, "admin").Handler()
@@ -63,7 +104,7 @@ func TestPublicV1CapabilitiesDescribeProtocolWithoutSecrets(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected capabilities status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if strings.Contains(rec.Body.String(), "123456Bin") || strings.Contains(rec.Body.String(), testAPIKey) {
+	if strings.Contains(rec.Body.String(), "example-real-password") || strings.Contains(rec.Body.String(), testAPIKey) {
 		t.Fatalf("capabilities must not expose secrets: %s", rec.Body.String())
 	}
 
@@ -150,6 +191,13 @@ func TestPublicV1TypedMessageEndpointsUseActionOutbox(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("unexpected v1 text status %d body=%s", rec.Code, rec.Body.String())
 	}
+	var textResponse PublicSendResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &textResponse); err != nil {
+		t.Fatalf("text response should be json: %v", err)
+	}
+	if textResponse.OutboxID <= 0 || textResponse.ChatRecordID != 0 || textResponse.Outbox.ChatRecordID != 0 {
+		t.Fatalf("queued response must expose only outbox id until ACK: %+v", textResponse)
+	}
 	items := pollOutbox(t, service, "phone-a", 10)
 	if len(items) != 1 || items[0].Kind != OutboxKindText || items[0].Text != "v1 hello" {
 		t.Fatalf("unexpected v1 text outbox item: %+v", items)
@@ -191,7 +239,7 @@ func TestPublicV1TypedMessageEndpointsUseActionOutbox(t *testing.T) {
 	}
 }
 
-func TestPublicV1GenericActionEndpointReturnsFirstOutboxAndWarning(t *testing.T) {
+func TestPublicV1GenericActionEndpointReturnsAllOutboxesAndCompatibilityFields(t *testing.T) {
 	service := newTestService("", WithMediaDir(t.TempDir()))
 	server := NewHTTPServer(service, "admin").Handler()
 
@@ -219,32 +267,40 @@ func TestPublicV1GenericActionEndpointReturnsFirstOutboxAndWarning(t *testing.T)
 	if !sent.OK || sent.Kind != OutboxKindText || sent.OutboxID <= 0 || sent.Outbox.ID != sent.OutboxID {
 		t.Fatalf("unexpected action response: %+v", sent)
 	}
+	if len(sent.OutboxIDs) != 2 || len(sent.Outboxes) != 2 || sent.OutboxIDs[0] != sent.OutboxID || sent.Outboxes[0].ID != sent.OutboxID {
+		t.Fatalf("multi-target response should include every outbox while keeping compatibility fields: %+v", sent)
+	}
+	if sent.ChatRecordID != 0 || sent.Outbox.ChatRecordID != 0 {
+		t.Fatalf("queued action response must not claim a real chat_record_id before ACK: %+v", sent)
+	}
 	if sent.Outbox.TargetWxID != "wxid_friend" || sent.Outbox.Text != "fanout through v1 action" {
 		t.Fatalf("action response should expose the first queued outbox item: %+v", sent.Outbox)
 	}
-	if !containsString(sent.Warnings, "multiple_targets_first_outbox_returned") {
-		t.Fatalf("multi-target action should warn about first outbox response: %+v", sent.Warnings)
+	if sent.Outboxes[1].TargetWxID != "wxid_second" || sent.Outboxes[1].Text != "fanout through v1 action" {
+		t.Fatalf("multi-target response should expose the second queued outbox item: %+v", sent.Outboxes)
+	}
+	if !containsString(sent.Warnings, "multiple_targets_outboxes_returned") || !containsString(sent.Warnings, "singular_outbox_fields_reference_first_target") {
+		t.Fatalf("multi-target action should describe compatibility fields: %+v", sent.Warnings)
 	}
 
 	targets := map[string]bool{}
-	for attempt := 0; attempt < 2; attempt++ {
-		items := pollOutbox(t, service, "phone-a", 10)
-		if len(items) != 1 {
-			t.Fatalf("module polling should expose one queued target at a time: %+v", items)
-		}
-		item := items[0]
+	items := pollOutbox(t, service, "phone-a", 10)
+	if len(items) != 2 {
+		t.Fatalf("module polling should expose queued targets as a batch: %+v", items)
+	}
+	for index, item := range items {
 		if item.Kind != OutboxKindText || item.OwnerWxID != "wxid_self" || item.Text != "fanout through v1 action" {
 			t.Fatalf("unexpected queued action item: %+v", item)
 		}
-		if attempt == 0 && item.ID != sent.OutboxID {
-			t.Fatalf("public response should point at first polled outbox item, response=%+v item=%+v", sent, item)
+		if item.ID != sent.OutboxIDs[index] || item.ID != sent.Outboxes[index].ID {
+			t.Fatalf("public response should preserve queued outbox order, response=%+v item=%+v", sent, item)
 		}
 		targets[item.WxID] = true
 		if _, err := service.AckOutbox(t.Context(), ModuleAckRequest{
 			APIKey: testAPIKey,
 			Device: "phone-a",
 			WxID:   "wxid_self",
-			Items:  []ModuleAckItem{{ID: item.ID, Status: "sent", ChatRecordID: 1000 + int64(attempt)}},
+			Items:  []ModuleAckItem{{ID: item.ID, Status: "sent", ChatRecordID: 1000 + int64(index)}},
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -431,6 +487,20 @@ func TestPublicV1TypedMessageEndpointsCoverAllActionKinds(t *testing.T) {
 				ids, ok := payload["source_chat_record_ids"].([]any)
 				if !ok || len(ids) != 2 || payload["record_title"] != "History" {
 					t.Fatalf("chat-history endpoint should preserve source ids and title, payload=%+v", payload)
+				}
+			},
+		},
+		{
+			name:     "revoke",
+			path:     "/api/v1/messages/revoke",
+			wantKind: OutboxKindRevoke,
+			fields: map[string]any{
+				"target_chat_record_id": 7654321,
+			},
+			checkItem: func(t *testing.T, item ModuleOutboxItem, payload map[string]any) {
+				t.Helper()
+				if item.Text != "[撤回]" || payload["target_chat_record_id"] != float64(7654321) {
+					t.Fatalf("revoke endpoint should preserve target id, item=%+v payload=%+v", item, payload)
 				}
 			},
 		},
@@ -962,6 +1032,37 @@ func TestPublicStoredMessageEnvelopeCorrectsLegacyPaymentKind(t *testing.T) {
 	}
 }
 
+func TestPublicV1SystemRevokeEnvelope(t *testing.T) {
+	event := MessageEvent{
+		ID:             "evt-revoke",
+		Device:         "phone-a",
+		Direction:      DirectionRecv,
+		MessageType:    10000,
+		MessageKind:    MessageKindSystem,
+		AppMsgSubtype:  SystemSubtypeRevoke,
+		AppMsgURL:      "room-a@chatroom",
+		AppMsgFileName: "12345",
+		AppMsgAppName:  "67890",
+		AppMsgTitle:    `"Alice" 撤回了一条消息`,
+		RawXML:         "<sysmsg>sensitive</sysmsg>",
+	}
+	envelope := publicEventMessageEnvelope(event)
+
+	if envelope.Kind != MessageKindSystem || envelope.Subtype != SystemSubtypeRevoke {
+		t.Fatalf("unexpected system envelope: %+v", envelope)
+	}
+	if envelope.AppMsg != nil {
+		t.Fatalf("system revoke should not be exposed as appmsg: %+v", envelope.AppMsg)
+	}
+	if envelope.System == nil ||
+		envelope.System.Subtype != SystemSubtypeRevoke ||
+		envelope.System.Session != "room-a@chatroom" ||
+		envelope.System.MsgID != "12345" ||
+		envelope.System.NewMsgID != "67890" {
+		t.Fatalf("system revoke payload missing: %+v", envelope.System)
+	}
+}
+
 func TestPublicV1WebSocketStreamsSanitizedEvents(t *testing.T) {
 	service := newTestService("")
 	service.Hub().Publish(MessageEvent{
@@ -1237,7 +1338,7 @@ func TestOpenAPIDocsArePublicAndDescribeActionProtocol(t *testing.T) {
 	if !ok {
 		t.Fatalf("openapi paths missing: %+v", spec)
 	}
-	for _, path := range []string{"/api/v1/capabilities", "/api/v1/messages/text", "/api/v1/messages/image", "/api/v1/messages/link", "/api/v1/messages/chat-history", "/api/v1/outbox/{id}", "/api/v1/ws", "/api/send/action", "/module/outbox/poll", "/module/outbox/ack", "/webhook/module/message"} {
+	for _, path := range []string{"/api/v1/capabilities", "/api/v1/messages/text", "/api/v1/messages/image", "/api/v1/messages/link", "/api/v1/messages/chat-history", "/api/v1/messages/revoke", "/api/v1/outbox/{id}", "/api/v1/ws", "/api/send/action", "/module/outbox/poll", "/module/outbox/ack", "/webhook/module/message"} {
 		if _, ok := paths[path]; !ok {
 			t.Fatalf("openapi path %s missing", path)
 		}
@@ -1260,7 +1361,7 @@ func TestOpenAPIDocsArePublicAndDescribeActionProtocol(t *testing.T) {
 			t.Fatalf("openapi spec should describe error code %s", code)
 		}
 	}
-	if strings.Contains(specRec.Body.String(), "123456Bin") {
+	if strings.Contains(specRec.Body.String(), "example-real-password") {
 		t.Fatalf("openapi spec must not contain secrets")
 	}
 }

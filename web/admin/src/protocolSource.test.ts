@@ -139,7 +139,8 @@ describe("protocol source alignment", () => {
       quote: "quote",
       link: "link",
       "mini-program": "mini_program",
-      "chat-history": "chat_history"
+      "chat-history": "chat_history",
+      revoke: "revoke"
     });
     expect(Object.values(routeMap)).toEqual([...SEND_ACTION_KINDS]);
   });
